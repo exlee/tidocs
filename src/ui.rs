@@ -87,6 +87,7 @@ struct App {
     list_state: ListState,
     detail_viewer: MarkdownViewer,
     detail_md: String,
+    detail_width: usize,
     doc_theme: ThemeConfig,
     /// Send search requests to the worker.
     tx: mpsc::Sender<SearchRequest>,
@@ -94,6 +95,17 @@ struct App {
     rx: mpsc::Receiver<SearchReply>,
     /// Monotonically increasing ID for each search request.
     search_id: u64,
+}
+
+impl App {
+    /// Rebuild the detail viewer if terminal width changed.
+    fn recreate_detail_viewer(&mut self, width: usize) {
+        if self.detail_width != width {
+            self.detail_viewer = MarkdownViewer::new().with_max_width(width);
+            self.detail_viewer.set_content(&self.detail_md, &self.doc_theme);
+            self.detail_width = width;
+        }
+    }
 }
 
 fn run_app(
@@ -126,9 +138,10 @@ fn run_app(
         sources: sources.clone(),
         query: String::new(),
         items: Vec::new(),
-        list_state: ListState::default().with_selected(Some(0)),
+        list_state: ListState::default(),
         detail_viewer: MarkdownViewer::new(),
         detail_md: String::new(),
+        detail_width: 0,
         doc_theme,
         tx: tx_req,
         rx: rx_rep,
@@ -276,7 +289,6 @@ fn handle_search_key(app: &mut App, key: event::KeyEvent) -> bool {
             {
                 let item = &app.registry.all_items()[idx];
                 app.detail_md = app.registry.load_doc_content(&item.html_rel);
-                app.detail_viewer.set_content(&app.detail_md, &app.doc_theme);
                 app.detail_viewer.scroll_to_top();
                 app.mode = AppMode::Detail;
             }
@@ -351,8 +363,15 @@ fn navigate_list(app: &mut App, delta: i32) {
     if app.items.is_empty() {
         return;
     }
-    let current = app.list_state.selected().unwrap_or(0) as i32;
-    let new = (current + delta).clamp(0, (app.items.len() - 1) as i32) as usize;
+    let new = match app.list_state.selected() {
+        Some(current) => {
+            ((current as i32 + delta).clamp(0, (app.items.len() - 1) as i32)) as usize
+        }
+        None => {
+            // No item selected yet: Down picks first, Up picks last
+            if delta > 0 { 0 } else { app.items.len() - 1 }
+        }
+    };
     app.list_state.select(Some(new));
     prefetch_around(app, new);
 }
@@ -521,6 +540,10 @@ fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
             .title(" doc "),
     );
     f.render_widget(title_bar, chunks[0]);
+
+    // Recreate viewer if terminal resized
+    let avail_width = chunks[1].width as usize;
+    app.recreate_detail_viewer(avail_width);
 
     // Markdown content
     app.detail_viewer.render(f, chunks[1], &app.doc_theme);

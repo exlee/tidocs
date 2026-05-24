@@ -1144,8 +1144,6 @@ pub fn render_doc_page(html: &str) -> String {
             ".sidebar-links".into(),        // sidebar links
             ".location".into(),             // breadcrumb location
         ])
-        .wrap(true)
-        .wrap_width(80)
         .build();
 
     match html_to_markdown_rs::convert(main_content, Some(options)) {
