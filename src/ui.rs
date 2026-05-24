@@ -7,16 +7,16 @@ use crossterm::{
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Margin, Rect},
-    style::{Color, Style, Stylize},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     Terminal,
 };
-use ratatui_markdown::{ThemeConfig, viewer::MarkdownViewer};
 use std::io::{self, Stdout};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
+use tui_markdown::{from_str_with_options, Options, StyleSheet};
 
 /// Main TUI loop
 pub fn run(registry: Registry, sources: Vec<DocSource>) {
@@ -85,10 +85,8 @@ struct App {
     query: String,
     items: Vec<usize>, // indices into registry
     list_state: ListState,
-    detail_viewer: MarkdownViewer,
     detail_md: String,
-    detail_width: usize,
-    doc_theme: ThemeConfig,
+    detail_scroll: u16,
     /// Send search requests to the worker.
     tx: mpsc::Sender<SearchRequest>,
     /// Receive search results from the worker.
@@ -97,14 +95,39 @@ struct App {
     search_id: u64,
 }
 
-impl App {
-    /// Rebuild the detail viewer if terminal width changed or content changed.
-    fn ensure_detail_viewer(&mut self, width: usize) {
-        if self.detail_width != width {
-            self.detail_viewer = MarkdownViewer::new().with_max_width(width);
-            self.detail_viewer.set_content(&self.detail_md, &self.doc_theme);
-            self.detail_width = width;
+#[derive(Clone)]
+struct DocStyleSheet;
+
+impl StyleSheet for DocStyleSheet {
+    fn heading(&self, level: u8) -> Style {
+        match level {
+            1 => Style::default().fg(Color::Rgb(130, 200, 255)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            2 => Style::default().fg(Color::Rgb(100, 220, 180)).add_modifier(Modifier::BOLD),
+            3 => Style::default().fg(Color::Rgb(255, 180, 100)).add_modifier(Modifier::BOLD),
+            _ => Style::default().fg(Color::Rgb(200, 210, 220)).add_modifier(Modifier::BOLD),
         }
+    }
+    fn code(&self) -> Style {
+        Style::default().fg(Color::Rgb(210, 200, 160))
+    }
+    fn link(&self) -> Style {
+        Style::default().fg(Color::Rgb(140, 180, 220))
+    }
+    fn blockquote(&self) -> Style {
+        Style::default().fg(Color::Rgb(120, 140, 160))
+    }
+    fn heading_meta(&self) -> Style {
+        Style::default().fg(Color::Rgb(120, 140, 160))
+    }
+    fn metadata_block(&self) -> Style {
+        Style::default().fg(Color::Rgb(120, 140, 160))
+    }
+}
+
+impl App {
+    fn detail_text(&self) -> Text<'_> {
+        let options = Options::new(DocStyleSheet);
+        from_str_with_options(&self.detail_md, &options)
     }
 }
 
@@ -113,15 +136,6 @@ fn run_app(
     registry: Registry,
     sources: Vec<DocSource>,
 ) -> io::Result<()> {
-    let doc_theme = ThemeConfig::builder()
-        .with_text_color(Color::Rgb(200, 210, 220))
-        .with_muted_text_color(Color::Rgb(120, 140, 160))
-        .with_border_color(Color::Rgb(60, 80, 100))
-        .with_primary_color(Color::Rgb(130, 200, 255))    // H1: bright blue + bold + underline
-        .with_secondary_color(Color::Rgb(255, 180, 100))  // H3: warm orange + bold
-        .with_info_color(Color::Rgb(180, 255, 180))       // H2: green-tinted
-        .build();
-
     // Spawn dedicated search thread with (path, kind) tuples
     let all_items: Vec<(String, String)> = registry.all_items()
         .iter()
@@ -140,10 +154,8 @@ fn run_app(
         query: String::new(),
         items: Vec::new(),
         list_state: ListState::default(),
-        detail_viewer: MarkdownViewer::new(),
         detail_md: String::new(),
-        detail_width: 0,
-        doc_theme,
+        detail_scroll: 0,
         tx: tx_req,
         rx: rx_rep,
         search_id: 0,
@@ -290,7 +302,7 @@ fn handle_search_key(app: &mut App, key: event::KeyEvent) -> bool {
             {
                 let item = &app.registry.all_items()[idx];
                 app.detail_md = app.registry.load_doc_content(&item.html_rel);
-                app.detail_width = 0; // force rebuild on next render
+                app.detail_scroll = 0;
                 app.mode = AppMode::Detail;
             }
         }
@@ -334,31 +346,31 @@ fn handle_detail_key(app: &mut App, key: event::KeyEvent) {
             app.mode = AppMode::Search;
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            app.detail_viewer.scroll_up(1);
+            app.detail_scroll = app.detail_scroll.saturating_sub(1);
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.detail_viewer.scroll_down(1);
+            app.detail_scroll = app.detail_scroll.saturating_add(1);
         }
         KeyCode::PageUp | KeyCode::Backspace => {
-            app.detail_viewer.page_up();
+            app.detail_scroll = app.detail_scroll.saturating_sub(15);
         }
         KeyCode::PageDown | KeyCode::Char(' ') => {
-            app.detail_viewer.page_down();
+            app.detail_scroll = app.detail_scroll.saturating_add(15);
         }
         _ if key.modifiers.contains(KeyModifiers::CONTROL) => match key.code {
             KeyCode::Char('f') | KeyCode::Char('b') => {
-                app.detail_viewer.page_down();
+                app.detail_scroll = app.detail_scroll.saturating_add(15);
             }
             KeyCode::Char('u') => {
-                app.detail_viewer.page_up();
+                app.detail_scroll = app.detail_scroll.saturating_sub(15);
             }
             _ => {}
         },
         KeyCode::Home => {
-            app.detail_viewer.scroll_to_top();
+            app.detail_scroll = 0;
         }
         KeyCode::End => {
-            app.detail_viewer.scroll_to_bottom();
+            app.detail_scroll = u16::MAX;
         }
         _ => {}
     }
@@ -542,12 +554,22 @@ fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
     );
     f.render_widget(title_bar, chunks[0]);
 
-    // Recreate viewer if terminal resized
-    let avail_width = chunks[1].width as usize;
-    app.ensure_detail_viewer(avail_width);
-
     // Markdown content
-    app.detail_viewer.render(f, chunks[1], &app.doc_theme);
+    let visible = chunks[1].height.saturating_sub(2) as usize;
+    let text = app.detail_text();
+    let line_count = text.lines.len();
+    let max_scroll = line_count.saturating_sub(visible) as u16;
+    let scroll = app.detail_scroll.min(max_scroll);
+
+    let content = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(60, 70, 80)))
+        )
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: true });
+    f.render_widget(content, chunks[1]);
 
     // Footer with key hints
     let footer = Paragraph::new(Line::from(vec![
@@ -647,5 +669,118 @@ fn kind_display(kind: &str) -> (Color, &'static str) {
         "keyword" => (Color::Rgb(180, 140, 140), "kw"),
         "reexport" => (Color::Rgb(150, 150, 150), ">>"),
         _ => (Color::Rgb(150, 150, 150), "??"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tui_markdown::{from_str_with_options, Options};
+
+    /// Render markdown through our DocStyleSheet and return the resulting Text.
+    fn render(md: &str) -> Text<'_> {
+        let options = Options::new(DocStyleSheet);
+        from_str_with_options(md, &options)
+    }
+
+    /// Format each line as `"<content> [styles...]"` for readable assertion output.
+    /// Describe a single Style as tokens like `fg=Rgb(130,200,255) bold underlined`, or `-` for default.
+    fn describe_style(style: &Style) -> String {
+        let mut parts = Vec::new();
+        match style.fg { Some(c) => parts.push(format!("fg={:?}", c)), None => {} }
+        match style.bg { Some(c) => parts.push(format!("bg={:?}", c)), None => {} }
+        let mods = style.add_modifier;
+        if mods.contains(Modifier::BOLD) { parts.push("bold".into()); }
+        if mods.contains(Modifier::ITALIC) { parts.push("italic".into()); }
+        if mods.contains(Modifier::UNDERLINED) { parts.push("underlined".into()); }
+        if mods.contains(Modifier::DIM) { parts.push("dim".into()); }
+        if parts.is_empty() {
+            "-".to_string()
+        } else {
+            parts.join(" ")
+        }
+    }
+
+    /// Format each rendered line as:
+    ///   `<idx>: <content> |base=<line-level-style>| <span-styles...>`
+    /// The `base=` column shows the ratatui Line's patched base style (where heading colors land).
+    /// Span styles are shown per-span; `-` means that span has no extra styling beyond the base.
+    fn format_text(text: &Text) -> String {
+        text.lines.iter().enumerate().map(|(i, line)| {
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let base = describe_style(&line.style);
+            let spans: Vec<String> = line.spans.iter().map(|s| describe_style(&s.style)).collect();
+            format!("{:04}: {:?} |{}| {}", i, content, base, spans.join(" "))
+        }).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Full rustdoc-like page: heading hierarchy, paragraphs, lists, code blocks, inline code.
+    #[test]
+    fn full_rustdoc_page_snapshot() {
+        let md = "# Peek<T>(struct)\n\nPeek at the next item in an iterator without consuming it.\n\n### Implementations\n\n#### `impl<T, I> Peek<T, I>`\n\nMethods on `Peek` that take `self`.\n\n##### `pub fn peek(&mut self) -> Option<&T>`\n\nLooks at the second element of an iterator **without advancing it**.\n\n```rust\nlet mut iter = vec![1, 2, 3].into_iter().peekable();\nassert_eq!(iter.peek(), Some(&1));\n```\n\n##### `pub fn peek_mut(&mut self) -> Option<&mut T>`\n\nLike [peek] but returns a mutable reference.\n\n- Returns `None` when the iterator is exhausted\n- Does not consume the element\n\n###### `fn example()`\n\nThis is a deeply nested heading.";
+        let text = render(md);
+        let formatted = format_text(&text);
+        insta::assert_snapshot!("full_rustdoc_page", formatted);
+    }
+
+    #[test]
+    fn h1_is_bright_blue_bold_underlined() {
+        let text = render("# Main Title");
+        let line = &text.lines[0];
+        // The heading prefix "# " and body share the same patched style.
+        let base_fg = line.style.fg;
+        assert_eq!(base_fg, Some(Color::Rgb(130, 200, 255)),
+            "H1 should be bright blue Rgb(130,200,255), got {:?}", base_fg);
+        assert!(line.style.add_modifier.contains(Modifier::BOLD), "H1 should be bold");
+        assert!(line.style.add_modifier.contains(Modifier::UNDERLINED), "H1 should be underlined");
+    }
+
+    #[test]
+    fn h2_is_teal_bold() {
+        let text = render("## Subtitle");
+        let line = &text.lines[0];
+        assert_eq!(line.style.fg, Some(Color::Rgb(100, 220, 180)),
+            "H2 should be teal Rgb(100,220,180), got {:?}", line.style.fg);
+        assert!(line.style.add_modifier.contains(Modifier::BOLD), "H2 should be bold");
+        assert!(!line.style.add_modifier.contains(Modifier::UNDERLINED), "H2 should NOT be underlined");
+    }
+
+    #[test]
+    fn h3_is_orange_bold() {
+        let text = render("### Section");
+        let line = &text.lines[0];
+        assert_eq!(line.style.fg, Some(Color::Rgb(255, 180, 100)),
+            "H3 should be orange Rgb(255,180,100), got {:?}", line.style.fg);
+        assert!(line.style.add_modifier.contains(Modifier::BOLD), "H3 should be bold");
+    }
+
+    #[test]
+    fn code_fence_and_indentation_snapshot() {
+        let md = r#"
+```rust
+fn main() {
+    println!("hello");
+        deeply_nested();
+}
+```
+"#;
+        let text = render(md);
+        let formatted = format_text(&text);
+        insta::assert_snapshot!("code_fence_indentation", formatted);
+
+        // Also do structural assertions
+        let lines_str: Vec<String> = text.lines.iter().map(|l| l.to_string()).collect();
+        assert!(lines_str.iter().any(|l| l == "```rust"), "missing opening fence");
+        assert!(lines_str.iter().any(|l| l == "```"), "missing closing fence");
+
+        let println_line = lines_str.iter()
+            .find(|l| l.contains("println"))
+            .unwrap_or_else(|| panic!("no println line in {:?}", lines_str));
+        assert!(println_line.starts_with("    "), "4-space indent lost: {:?}", println_line);
+
+        let nested_line = lines_str.iter()
+            .find(|l| l.contains("deeply_nested"))
+            .unwrap_or_else(|| panic!("no deeply_nested line in {:?}", lines_str));
+        assert!(nested_line.starts_with("        "), "8-space indent lost: {:?}", nested_line);
     }
 }
