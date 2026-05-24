@@ -336,7 +336,7 @@ fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
             " {} items (from {} total)  [{}]",
             item_count,
             total,
-            app.sources.iter().map(|s| s.label.as_str()).collect::<Vec<_>>().join(", ")
+            app.sources.iter().map(|s| s.label()).collect::<Vec<_>>().join(", ")
         )),
         Span::raw("  "),
         Span::styled("[?] help", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),

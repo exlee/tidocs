@@ -24,20 +24,7 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    // Always start with auto-discovered sources
-    let (mut registry, mut sources) = docs::Registry::load_all_known();
-
-    // Add any extra paths on top
-    for p in &cli.paths {
-        let root = docs::discover_doc_root(p);
-        let source = docs::DocSource {
-            id: docs::source_id_for_path(&root),
-            path: root.clone(),
-            label: root.display().to_string(),
-        };
-        registry = registry.with_extra_root(&root);
-        sources.push(source);
-    }
+    let (registry, sources) = docs::Registry::load(&cli.paths);
 
     match cli.query {
         Some(query) => {
