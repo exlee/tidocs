@@ -7,9 +7,10 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "clidoc", about = "Browse Rust documentation in the terminal")]
 struct Cli {
-    /// Doc source path (rustup doc root, cargo target/doc, or crate source dir)
+    /// Extra doc source paths (added on top of auto-discovered sources).
+    /// Each can be a rustup doc root, cargo target/doc, or crate source dir.
     #[arg(value_name = "PATH")]
-    path: Option<PathBuf>,
+    paths: Vec<PathBuf>,
 
     /// Search query (non-interactive mode: prints matching items to stdout)
     #[arg(short, long)]
@@ -23,21 +24,20 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    let mut doc_roots = Vec::new();
+    // Always start with auto-discovered sources
+    let (mut registry, mut sources) = docs::Registry::load_all_known();
 
-    match cli.path {
-        Some(p) => doc_roots.push(docs::discover_doc_root(&p)),
-        None => {
-            doc_roots.push(docs::default_doc_root());
-            // Auto-merge local target/doc if present in cwd
-            let local = std::env::current_dir().unwrap_or_default().join("target/doc");
-            if local.is_dir() {
-                doc_roots.push(local);
-            }
-        }
+    // Add any extra paths on top
+    for p in &cli.paths {
+        let root = docs::discover_doc_root(p);
+        let source = docs::DocSource {
+            id: docs::source_id_for_path(&root),
+            path: root.clone(),
+            label: root.display().to_string(),
+        };
+        registry = registry.with_extra_root(&root);
+        sources.push(source);
     }
-
-    let registry = docs::Registry::load(&doc_roots);
 
     match cli.query {
         Some(query) => {
@@ -60,7 +60,7 @@ fn main() {
             }
         }
         None => {
-            ui::run(registry, doc_roots);
+            ui::run(registry, sources);
         }
     }
 }

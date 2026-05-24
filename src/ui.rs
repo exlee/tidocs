@@ -1,4 +1,4 @@
-use crate::docs::Registry;
+use crate::docs::{DocSource, Registry};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
@@ -14,12 +14,11 @@ use ratatui::{
 };
 use ratatui_markdown::{ThemeConfig, viewer::MarkdownViewer};
 use std::io::{self, Stdout};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Main TUI loop
-pub fn run(registry: Registry, doc_roots: Vec<PathBuf>) {
+pub fn run(registry: Registry, sources: Vec<DocSource>) {
     // Setup terminal
     enable_raw_mode().expect("failed to enable raw mode");
     let mut stdout = io::stdout();
@@ -43,7 +42,7 @@ pub fn run(registry: Registry, doc_roots: Vec<PathBuf>) {
         }
     }).expect("failed to set Ctrl-C handler");
 
-    let result = run_app(&mut terminal, registry, doc_roots);
+    let result = run_app(&mut terminal, registry, sources);
 
     // Mark as stopped so a pending SIGINT doesn't double-restore
     running.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -68,7 +67,7 @@ enum AppMode {
 struct App {
     mode: AppMode,
     registry: Registry,
-    doc_roots: Vec<PathBuf>,
+    sources: Vec<DocSource>,
     query: String,
     items: Vec<usize>, // indices into registry
     list_state: ListState,
@@ -80,7 +79,7 @@ struct App {
 fn run_app(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     registry: Registry,
-    doc_roots: Vec<PathBuf>,
+    sources: Vec<DocSource>,
 ) -> io::Result<()> {
     let doc_theme = ThemeConfig::builder()
         .with_text_color(Color::Rgb(200, 210, 220))
@@ -93,7 +92,7 @@ fn run_app(
     let mut app = App {
         mode: AppMode::Search,
         registry,
-        doc_roots,
+        sources: sources.clone(),
         query: String::new(),
         items: Vec::new(),
         list_state: ListState::default().with_selected(Some(0)),
@@ -337,7 +336,7 @@ fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
             " {} items (from {} total)  [{}]",
             item_count,
             total,
-            app.doc_roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", ")
+            app.sources.iter().map(|s| s.label.as_str()).collect::<Vec<_>>().join(", ")
         )),
         Span::raw("  "),
         Span::styled("[?] help", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),

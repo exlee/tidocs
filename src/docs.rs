@@ -3,7 +3,6 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tokio::runtime::Handle;
 
 use rusqlite::params;
 
@@ -40,38 +39,92 @@ impl DocItem {
     }
 }
 
-/// Registry of all doc items, loaded from sidebar-items JS and all.html files
+/// A known doc source (a directory on disk that contains rustdoc HTML).
+#[derive(Debug, Clone)]
+pub struct DocSource {
+    /// Unique identifier for this source in SQLite
+    pub id: String,
+    /// The filesystem path (canonicalized)
+    pub path: PathBuf,
+    /// Human-readable label
+    pub label: String,
+}
+
+/// Registry of all doc items, loaded from SQLite cache or HTML files.
 pub struct Registry {
     items: Vec<DocItem>,
     doc_roots: Vec<PathBuf>,
     content_cache: Arc<Mutex<HashMap<String, String>>>,
-    runtime: Handle,
+    runtime: tokio::runtime::Handle,
 }
 
 impl Registry {
+    /// Load the registry from explicit doc roots, using per-source SQLite cache.
     pub fn load(doc_roots: &[PathBuf]) -> Self {
-        eprintln!("[clidoc] loading docs...");
-        let items = match Self::load_from_cache(doc_roots) {
-            Some(cached) => {
-                eprintln!("[clidoc] loaded {} items from cache", cached.len());
-                cached
-            }
-            None => {
-                eprintln!("[clidoc] cache miss, scanning HTML files...");
-                let mut items = Vec::new();
-                for root in doc_roots {
-                    eprintln!("[clidoc] scanning {}", root.display());
-                    load_from_html_dir(root, &mut items);
+        let mut all_items = Vec::new();
+
+        for root in doc_roots {
+            let source_id = source_id_for_path(root);
+            match db_load_items(&source_id) {
+                Some(cached) => {
+                    eprintln!("[clidoc] {} items from cache: {}", cached.len(), root.display());
+                    all_items.extend(cached);
                 }
-                eprintln!("[clidoc] found {} items, saving to cache", items.len());
-                items.sort_by(|a, b| a.path.cmp(&b.path));
-                items.dedup_by(|a, b| a.path == b.path);
-                Self::save_to_cache(doc_roots, &items);
-                items
+                None => {
+                    eprintln!("[clidoc] scanning {} ...", root.display());
+                    let mut items = Vec::new();
+                    load_from_html_dir(root, &mut items);
+                    items.sort_by(|a, b| a.path.cmp(&b.path));
+                    items.dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
+                    eprintln!("[clidoc] found {} items in {}", items.len(), root.display());
+                    db_save_items(&source_id, root, &items);
+                    all_items.extend(items);
+                }
             }
-        };
-        eprintln!("[clidoc] starting TUI with {} items", items.len());
-        Self::new(items, doc_roots.to_vec())
+        }
+
+        // Global dedup
+        all_items.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.kind.cmp(&b.kind)));
+        all_items.dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
+
+        eprintln!("[clidoc] total: {} items", all_items.len());
+        Self::new(all_items, doc_roots.to_vec())
+    }
+
+    /// Load registry from all known doc sources (auto-discovery + SQLite).
+    /// Returns (registry, list of active sources).
+    pub fn load_all_known() -> (Self, Vec<DocSource>) {
+        let sources = discover_doc_sources();
+        eprintln!("[clidoc] discovered {} doc sources", sources.len());
+
+        let mut all_items = Vec::new();
+        let mut active_sources = Vec::new();
+
+        for source in &sources {
+            if db_needs_scan(&source.id, &source.path) {
+                eprintln!("[clidoc] scanning {} ...", source.label);
+                let mut items = Vec::new();
+                load_from_html_dir(&source.path, &mut items);
+                items.sort_by(|a, b| a.path.cmp(&b.path));
+                items.dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
+                db_save_items(&source.id, &source.path, &items);
+                eprintln!("[clidoc] {} items from {}", items.len(), source.label);
+                all_items.extend(items);
+            } else {
+                if let Some(cached) = db_load_items(&source.id) {
+                    eprintln!("[clidoc] {} items from cache: {}", cached.len(), source.label);
+                    all_items.extend(cached);
+                }
+            }
+            active_sources.push(source.clone());
+        }
+
+        all_items.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.kind.cmp(&b.kind)));
+        all_items.dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
+
+        eprintln!("[clidoc] total: {} items", all_items.len());
+        let roots: Vec<PathBuf> = sources.iter().map(|s| s.path.clone()).collect();
+        (Self::new(all_items, roots), active_sources)
     }
 
     fn new(items: Vec<DocItem>, doc_roots: Vec<PathBuf>) -> Self {
@@ -88,165 +141,6 @@ impl Registry {
             content_cache: Arc::new(Mutex::new(HashMap::new())),
             runtime: handle,
         }
-    }
-
-    fn db_path() -> Option<PathBuf> {
-        let cache_dir = dirs::cache_dir()?.join("clidoc");
-        fs::create_dir_all(&cache_dir).ok()?;
-        Some(cache_dir.join("index.db"))
-    }
-
-    /// Compute a fingerprint for the doc root by hashing sidebar-items and all.html mtimes.
-    fn compute_fingerprint(doc_roots: &[PathBuf]) -> Option<String> {
-        let mut entries: Vec<(String, u64)> = Vec::new();
-        for root in doc_roots {
-            let mut stack = vec![root.clone()];
-            while let Some(dir) = stack.pop() {
-                let Ok(read_dir) = fs::read_dir(&dir) else { continue };
-                for entry in read_dir.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        stack.push(path);
-                        continue;
-                    }
-                    let name = path.file_name()?.to_str()?.to_string();
-                    if name.starts_with("sidebar-items") || name == "all.html" {
-                        let mtime = entry.metadata().ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-                        let rel = path.strip_prefix(root).ok()?.to_string_lossy().to_string();
-                        entries.push((format!("{:?}:{}", root, rel), mtime));
-                    }
-                }
-            }
-        }
-        entries.sort();
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for (rel, mtime) in &entries {
-            rel.hash(&mut hasher);
-            mtime.hash(&mut hasher);
-        }
-        Some(format!("{:x}", hasher.finish()))
-    }
-
-    fn load_from_cache(doc_roots: &[PathBuf]) -> Option<Vec<DocItem>> {
-        let db_path = Self::db_path()?;
-        let conn = rusqlite::Connection::open(&db_path).ok()?;
-
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sources (
-                doc_root TEXT PRIMARY KEY,
-                fingerprint TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS items (
-                source TEXT NOT NULL,
-                path TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                html_rel TEXT NOT NULL,
-                desc TEXT,
-                PRIMARY KEY (source, path, kind)
-            );"
-        ).ok()?;
-
-        let fingerprint = Self::compute_fingerprint(doc_roots)?;
-        let roots_key: String = doc_roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(":");
-
-        let stored_fp: Option<String> = conn
-            .query_row(
-                "SELECT fingerprint FROM sources WHERE doc_root = ?1",
-                params![&roots_key],
-                |row| row.get(0),
-            )
-            .ok();
-
-        if stored_fp.as_deref() != Some(&fingerprint) {
-            return None;
-        }
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT path, kind, html_rel, desc FROM items WHERE source = ?1 ORDER BY path",
-            )
-            .ok()?;
-
-        let items: Vec<DocItem> = stmt
-            .query_map(params![&roots_key], |row| {
-                Ok(DocItem {
-                    path: row.get(0)?,
-                    kind: row.get(1)?,
-                    html_rel: row.get(2)?,
-                    desc: row.get(3)?,
-                })
-            })
-            .ok()?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        if items.is_empty() { None } else { Some(items) }
-    }
-
-    fn save_to_cache(doc_roots: &[PathBuf], items: &[DocItem]) {
-        let db_path = match Self::db_path() {
-            Some(p) => p,
-            None => return,
-        };
-        let mut conn = match rusqlite::Connection::open(&db_path) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-
-        let _ = conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sources (
-                doc_root TEXT PRIMARY KEY,
-                fingerprint TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS items (
-                source TEXT NOT NULL,
-                path TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                html_rel TEXT NOT NULL,
-                desc TEXT,
-                PRIMARY KEY (source, path, kind)
-            );"
-        );
-
-        let fingerprint = match Self::compute_fingerprint(doc_roots) {
-            Some(fp) => fp,
-            None => return,
-        };
-
-        let roots_key: String = doc_roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(":");
-
-        let _ = conn.execute(
-            "INSERT OR REPLACE INTO sources (doc_root, fingerprint) VALUES (?1, ?2)",
-            params![&roots_key, &fingerprint],
-        );
-
-        let _ = conn.execute(
-            "DELETE FROM items WHERE source = ?1",
-            params![&roots_key],
-        );
-
-        let tx = match conn.transaction() {
-            Ok(tx) => tx,
-            Err(_) => return,
-        };
-        {
-            let mut stmt = match tx.prepare(
-                "INSERT INTO items (source, path, kind, html_rel, desc) VALUES (?1, ?2, ?3, ?4, ?5)"
-            ) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            for item in items {
-                let _ = stmt.execute(params![
-                    &roots_key,
-                    &item.path,
-                    &item.kind,
-                    &item.html_rel,
-                    &item.desc,
-                ]);
-            }
-        }
-        let _ = tx.commit();
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<&DocItem> {
@@ -268,9 +162,45 @@ impl Registry {
         &self.items
     }
 
+    /// Add items from an extra doc root on top of existing items.
+    pub fn with_extra_root(self, root: &Path) -> Self {
+        let source_id = source_id_for_path(root);
+        let extra = match db_load_items(&source_id) {
+            Some(cached) => {
+                eprintln!("[clidoc] {} extra items from cache: {}", cached.len(), root.display());
+                cached
+            }
+            None => {
+                eprintln!("[clidoc] scanning extra source {} ...", root.display());
+                let mut items = Vec::new();
+                load_from_html_dir(root, &mut items);
+                items.sort_by(|a, b| a.path.cmp(&b.path));
+                items.dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
+                eprintln!("[clidoc] found {} extra items in {}", items.len(), root.display());
+                db_save_items(&source_id, root, &items);
+                items
+            }
+        };
+
+        let mut all_items = self.items;
+        all_items.extend(extra);
+        // Dedup
+        all_items.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.kind.cmp(&b.kind)));
+        all_items.dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
+        eprintln!("[clidoc] total: {} items", all_items.len());
+
+        let mut roots = self.doc_roots;
+        roots.push(root.to_path_buf());
+        Self {
+            items: all_items,
+            doc_roots: roots,
+            content_cache: self.content_cache,
+            runtime: self.runtime,
+        }
+    }
+
     /// Load and cache doc content for an item by its html_rel path.
     pub fn load_doc_content(&self, html_rel: &str) -> String {
-        // Check cache first
         if let Some(cached) = self.content_cache.lock().unwrap().get(html_rel) {
             return cached.clone();
         }
@@ -279,8 +209,7 @@ impl Registry {
         content
     }
 
-    /// Prefetch doc content asynchronously. Safe to call repeatedly --
-    /// already-cached items are skipped cheaply.
+    /// Prefetch doc content asynchronously.
     pub fn prefetch(&self, html_rels: Vec<String>) {
         let cache = Arc::clone(&self.content_cache);
         let roots = self.doc_roots.clone();
@@ -330,6 +259,259 @@ impl Registry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SQLite cache (per-source, free functions)
+// ---------------------------------------------------------------------------
+
+fn db_ensure_tables(conn: &rusqlite::Connection) {
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sources (
+            id TEXT PRIMARY KEY,
+            path TEXT NOT NULL,
+            fingerprint TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS items (
+            source TEXT NOT NULL,
+            path TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            html_rel TEXT NOT NULL,
+            desc TEXT,
+            PRIMARY KEY (source, path, kind)
+        );"
+    );
+}
+
+fn db_load_items(source_id: &str) -> Option<Vec<DocItem>> {
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("clidoc");
+    fs::create_dir_all(&cache_dir).ok();
+    let db_path = cache_dir.join("index.db");
+    let conn = rusqlite::Connection::open(&db_path).ok()?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sources (
+            id TEXT PRIMARY KEY,
+            path TEXT NOT NULL,
+            fingerprint TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS items (
+            source TEXT NOT NULL,
+            path TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            html_rel TEXT NOT NULL,
+            desc TEXT,
+            PRIMARY KEY (source, path, kind)
+        );"
+    ).ok()?;
+
+    let mut stmt = conn
+        .prepare("SELECT path, kind, html_rel, desc FROM items WHERE source = ?1 ORDER BY path")
+        .ok()?;
+    let items: Vec<DocItem> = stmt
+        .query_map(params![source_id], |row| {
+            Ok(DocItem {
+                path: row.get(0)?,
+                kind: row.get(1)?,
+                html_rel: row.get(2)?,
+                desc: row.get(3)?,
+            })
+        })
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+    if items.is_empty() { None } else { Some(items) }
+}
+
+fn db_needs_scan(source_id: &str, path: &Path) -> bool {
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("clidoc");
+    fs::create_dir_all(&cache_dir).ok();
+    let db_path = cache_dir.join("index.db");
+    let conn = match rusqlite::Connection::open(&db_path) {
+        Ok(c) => c,
+        Err(_) => return true,
+    };
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, path TEXT NOT NULL, fingerprint TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS items (source TEXT NOT NULL, path TEXT NOT NULL, kind TEXT NOT NULL, html_rel TEXT NOT NULL, desc TEXT, PRIMARY KEY (source, path, kind));"
+    ).ok();
+
+    let fp = match compute_source_fingerprint(path) {
+        Some(fp) => fp,
+        None => return true,
+    };
+    let stored: Option<String> = conn
+        .query_row("SELECT fingerprint FROM sources WHERE id = ?1", params![source_id], |row| row.get(0))
+        .ok();
+    stored.as_deref() != Some(&fp)
+}
+
+fn db_save_items(source_id: &str, source_path: &Path, items: &[DocItem]) {
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("clidoc");
+    fs::create_dir_all(&cache_dir).ok();
+    let db_path = cache_dir.join("index.db");
+    let mut conn = match rusqlite::Connection::open(&db_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    db_ensure_tables(&conn);
+
+    let fp = match compute_source_fingerprint(source_path) {
+        Some(fp) => fp,
+        None => return,
+    };
+    let path_str = source_path.display().to_string();
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO sources (id, path, fingerprint) VALUES (?1, ?2, ?3)",
+        params![source_id, &path_str, &fp],
+    );
+    let _ = conn.execute("DELETE FROM items WHERE source = ?1", params![source_id]);
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(_) => return,
+    };
+    {
+        let mut stmt = match tx.prepare(
+            "INSERT INTO items (source, path, kind, html_rel, desc) VALUES (?1, ?2, ?3, ?4, ?5)"
+        ) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        for item in items {
+            let _ = stmt.execute(params![source_id, &item.path, &item.kind, &item.html_rel, &item.desc]);
+        }
+    }
+    let _ = tx.commit();
+}
+
+/// Compute fingerprint for a single doc root directory.
+fn compute_source_fingerprint(path: &Path) -> Option<String> {
+    let mut entries: Vec<(String, u64)> = Vec::new();
+
+    // Top-level all.html if present (single-crate roots)
+    let all_html = path.join("all.html");
+    if all_html.exists() {
+        let mtime = fs::metadata(&all_html).ok()?.modified().ok()?
+            .duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+        entries.push(("all.html".to_string(), mtime));
+    }
+
+    // Top-level sidebar-items
+    for name in &["sidebar-items.js", "sidebar-items1.87.0.js"] {
+        let sb = path.join(name);
+        if sb.exists() {
+            let mtime = fs::metadata(&sb).ok()?.modified().ok()?
+                .duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+            entries.push((name.to_string(), mtime));
+        }
+    }
+
+    // Sub-directory sidebar-items + all.html (for multi-crate roots like rustup)
+    if let Ok(rd) = fs::read_dir(path) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if !p.is_dir() { continue; }
+            let dir_name = p.file_name()?.to_str()?.to_string();
+
+            let sub_all = p.join("all.html");
+            if sub_all.exists() {
+                let mtime = fs::metadata(&sub_all).ok()?.modified().ok()?
+                    .duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+                entries.push((format!("{dir_name}/all.html"), mtime));
+            }
+
+            for sb_name in &["sidebar-items.js", "sidebar-items1.87.0.js"] {
+                let sb = p.join(sb_name);
+                if sb.exists() {
+                    let mtime = fs::metadata(&sb).ok()?.modified().ok()?
+                        .duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+                    entries.push((format!("{dir_name}/{sb_name}"), mtime));
+                }
+            }
+        }
+    }
+
+    if entries.is_empty() { return None; }
+
+    entries.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (rel, mtime) in &entries {
+        rel.hash(&mut hasher);
+        mtime.hash(&mut hasher);
+    }
+    Some(format!("{:x}", hasher.finish()))
+}
+
+/// Generate a unique source ID from a filesystem path.
+pub fn source_id_for_path(path: &Path) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.to_string_lossy().hash(&mut hasher);
+    format!("s:{:x}", hasher.finish())
+}
+
+/// Auto-discover doc sources from known locations.
+pub fn discover_doc_sources() -> Vec<DocSource> {
+    let mut sources = Vec::new();
+
+    // 1. Rustup std docs
+    let home = dirs::home_dir().unwrap_or_default();
+    let rustup_base = home.join(".rustup/toolchains");
+    let mut rustup_toolchain_names: Vec<String> = Vec::new();
+
+    if rustup_base.is_dir() {
+        if let Ok(rd) = fs::read_dir(&rustup_base) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                let doc_dir = p.join("share/doc/rust/html");
+                if doc_dir.join("all.html").exists() || has_crate_subdirs(&doc_dir) {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+                    rustup_toolchain_names.push(name.to_string());
+                    sources.push(DocSource {
+                        id: source_id_for_path(&doc_dir),
+                        path: doc_dir,
+                        label: format!("rustup/{name}"),
+                    });
+                }
+            }
+        }
+        // Keep only the active toolchain
+        if rustup_toolchain_names.len() > 1 {
+            if let Ok(output) = std::process::Command::new("rustup").args(["show", "active-toolchain"]).output() {
+                let active = String::from_utf8_lossy(&output.stdout)
+                    .split_whitespace().next().unwrap_or("").to_string();
+                sources.retain(|s| s.label.ends_with(&format!("/{active}")));
+            }
+        }
+    }
+
+    sources
+}
+
+/// Check if a directory is a multi-crate doc root (contains subdirectories with sidebar-items).
+fn has_crate_subdirs(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.path().is_dir() && read_dir_has_sidebar(&e.path()))
+        })
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-word search
+// ---------------------------------------------------------------------------
+
 /// Multi-word substring match. Each word must appear as a case-insensitive substring.
 /// Returns a score (higher = better) or None if any word is missing.
 pub(crate) fn match_item_score(path: &str, words: &[&str]) -> Option<i32> {
@@ -353,6 +535,10 @@ pub(crate) fn match_item_score(path: &str, words: &[&str]) -> Option<i32> {
     Some(total_score)
 }
 
+// ---------------------------------------------------------------------------
+// HTML parsing / item extraction
+// ---------------------------------------------------------------------------
+
 /// Check if a directory contains a sidebar-items JS file
 fn read_dir_has_sidebar(dir: &Path) -> bool {
     fs::read_dir(dir)
@@ -370,29 +556,23 @@ fn load_from_html_dir(base: &Path, items: &mut Vec<DocItem>) {
         return;
     }
 
-    // Check if this is a multi-crate root (like rustup's html/ dir)
-    // by looking for subdirectories with top-level sidebar-items
+    // Check if this is a multi-crate root
     let mut has_crate_subdirs = false;
     if let Ok(entries) = fs::read_dir(base) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
-                let has_sidebar = read_dir_has_sidebar(&path);
-                if has_sidebar {
-                    has_crate_subdirs = true;
-                    // This is a crate directory
-                    let crate_name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    load_crate(&path, &crate_name, items);
-                }
+            if path.is_dir() && read_dir_has_sidebar(&path) {
+                has_crate_subdirs = true;
+                let crate_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                load_crate(&path, &crate_name, items);
             }
         }
     }
 
-    // If no crate subdirs found, treat base itself as a single crate
     if !has_crate_subdirs {
         let crate_name = base
             .file_name()
@@ -402,32 +582,25 @@ fn load_from_html_dir(base: &Path, items: &mut Vec<DocItem>) {
         load_crate(base, &crate_name, items);
     }
 
-    // Deduplicate by path
     items.sort_by(|a, b| a.path.cmp(&b.path));
-    items.dedup_by(|a, b| a.path == b.path);
+    items.dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
 }
 
-/// Load all items for a single crate from its doc HTML directory.
-/// `crate_dir_name` is the directory name (e.g., "std") used to prefix HTML paths.
 fn load_crate(base: &Path, crate_name: &str, items: &mut Vec<DocItem>) {
     let crate_dir_name = base
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(crate_name);
 
-    // Parse all.html for the full flat listing
     load_all_html(base, crate_name, crate_dir_name, items);
-
-    // Extract methods from individual HTML pages
     load_methods(base, items);
 
-    // Recurse into subdirectories that have sidebar-items
+    // Recurse into subdirectories with sidebar-items
     if let Ok(entries) = fs::read_dir(base) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() && path.file_name().is_some_and(|n| n != "." && n != "..") {
-                let has_sidebar = read_dir_has_sidebar(&path);
-                if has_sidebar {
+                if read_dir_has_sidebar(&path) {
                     let sub_name = path
                         .file_name()
                         .and_then(|n| n.to_str())
@@ -439,11 +612,7 @@ fn load_crate(base: &Path, crate_name: &str, items: &mut Vec<DocItem>) {
     }
 }
 
-/// Extract methods and associated items from individual HTML pages.
-/// For each struct/enum/trait/primitive item, scan its HTML file for
-/// `<h4 class="code-header">` entries and create child items.
 fn load_methods(base: &Path, items: &mut Vec<DocItem>) {
-    // Collect paths of items that can have methods
     let method_holders: Vec<(String, String)> = items
         .iter()
         .filter(|item| {
@@ -458,18 +627,11 @@ fn load_methods(base: &Path, items: &mut Vec<DocItem>) {
     let mut seen: HashSet<String> = HashSet::new();
     let mut new_items: Vec<DocItem> = Vec::new();
 
-    // Regex matches <h4 class="code-header"> entries and extracts:
-    //   group 1: anchor type (method|tymethod|associatedconstant)
-    //   group 2: method name
-    //   group 3: CSS class (fn|const)
     let re = regex::Regex::new(
         r###"<h4 class="code-header">.*?href="#(method|tymethod|associatedconstant)\.([a-z_][a-z0-9_]*)".*?class="(fn|const)">.*?</h4>"###,
     )
     .expect("invalid regex");
 
-    // Extract methods from individual HTML pages.
-    // html_rel includes crate prefix (e.g. "std/vec/struct.Vec.html"),
-    // so we need to resolve against the parent of the crate directory.
     let file_root = base.parent().unwrap_or(base);
 
     for (parent_path, html_rel) in method_holders {
@@ -479,9 +641,9 @@ fn load_methods(base: &Path, items: &mut Vec<DocItem>) {
         };
 
         for cap in re.captures_iter(&raw) {
-            let anchor_type = &cap[1]; // method, tymethod, associatedconstant
+            let anchor_type = &cap[1];
             let name = &cap[2];
-            let css_class = &cap[3]; // fn, const
+            let css_class = &cap[3];
 
             let kind = match css_class {
                 "fn" => "method",
@@ -508,7 +670,6 @@ fn load_methods(base: &Path, items: &mut Vec<DocItem>) {
     items.extend(new_items);
 }
 
-/// Parse all.html to extract all documented items with their hrefs.
 fn load_all_html(base: &Path, crate_name: &str, crate_dir_name: &str, items: &mut Vec<DocItem>) {
     let all_html = base.join("all.html");
     if !all_html.exists() {
@@ -518,7 +679,6 @@ fn load_all_html(base: &Path, crate_name: &str, crate_dir_name: &str, items: &mu
         return;
     };
 
-    // First detect sections from h3 headers (works across all rustdoc versions)
     for (kind, pos) in extract_all_sections(&content) {
         for (href, text) in extract_links_in_section(&content, pos) {
             let full_path = format!("{}::{}", crate_name, text);
@@ -533,7 +693,6 @@ fn load_all_html(base: &Path, crate_name: &str, crate_dir_name: &str, items: &mu
     }
 }
 
-/// Strip HTML tags from a string, returning only the text content.
 fn strip_html_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut inside_tag = false;
@@ -548,14 +707,12 @@ fn strip_html_tags(s: &str) -> String {
     out
 }
 
-/// Extract (kind, position) pairs from section headers in all.html.
 fn extract_all_sections(html: &str) -> Vec<(String, usize)> {
     let mut sections = Vec::new();
     let mut pos = 0;
     while pos < html.len() {
         if let Some(start) = html[pos..].find("<h3") {
             pos += start;
-            // Extract section kind from the h3
             let section_kind = detect_section_kind(&html[pos..]).unwrap_or("mod".to_string());
             sections.push((section_kind, pos));
             pos += 4;
@@ -566,10 +723,8 @@ fn extract_all_sections(html: &str) -> Vec<(String, usize)> {
     sections
 }
 
-/// Extract all links from the HTML body between `section_start` (an h3 position) and the next h3 or end.
 fn extract_links_in_section(html: &str, section_start: usize) -> Vec<(String, String)> {
     let body = &html[section_start..];
-    // Find the next <h3 to know our boundary
     let boundary = if let Some(h3) = body.find("<h3") {
         if h3 > 0 { h3 } else { body.len() }
     } else {
@@ -584,19 +739,16 @@ fn extract_links_in_section(html: &str, section_start: usize) -> Vec<(String, St
             let href_start = pos + start + 6;
             if let Some(end) = section[href_start..].find('"') {
                 let href = &section[href_start..href_start + end];
-                // Skip non-doc links (no extension, no slash, relative navigation)
                 if !href.contains(".") && !href.contains("/") && !href.contains("../") {
                     pos = href_start + end;
                     continue;
                 }
-                // Look for the link text
                 let after_href = &section[href_start + end..];
                 if let Some(text_start) = after_href.find('>') {
                     let text_area = &after_href[text_start + 1..];
                     if let Some(text_end) = text_area.find("</a>") {
                         let raw_text = text_area[..text_end].trim();
                         let text = strip_html_tags(raw_text).trim().to_string();
-                        // Only include links that look like doc items
                         if !text.is_empty() && href.ends_with(".html") {
                             links.push((href.to_string(), text));
                             pos = href_start + end + text_start + 1 + text_end + 4;
@@ -671,14 +823,9 @@ fn detect_section_kind(line: &str) -> Option<String> {
     None
 }
 
-/// Recursively load items from sub-modules.
-/// `module_path` is the full path from crate root (e.g., "io::buffered").
-/// `crate_dir_name` is the directory name used for HTML path prefix.
 fn load_submodule(dir: &Path, crate_name: &str, crate_dir_name: &str, module_path: &str, items: &mut Vec<DocItem>) {
-    // Load sidebar items for this submodule
     let sidebar = load_sidebar(dir);
 
-    // Build items from sidebar data
     for (kind, names) in &sidebar {
         for name in names {
             let item_path = if module_path.is_empty() {
@@ -696,7 +843,6 @@ fn load_submodule(dir: &Path, crate_name: &str, crate_dir_name: &str, module_pat
         }
     }
 
-    // Also load all.html if present (catches everything)
     let all_html = dir.join("all.html");
     if all_html.exists()
         && let Ok(content) = fs::read_to_string(&all_html)
@@ -719,24 +865,20 @@ fn load_submodule(dir: &Path, crate_name: &str, crate_dir_name: &str, module_pat
         }
     }
 
-    // Recurse deeper
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
-                let has_sidebar = read_dir_has_sidebar(&path);
-                if has_sidebar {
-                    let sub_name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("");
-                    let sub_path = if module_path.is_empty() {
-                        sub_name.to_string()
-                    } else {
-                        format!("{}::{}", module_path, sub_name)
-                    };
-                    load_submodule(&path, crate_name, crate_dir_name, &sub_path, items);
-                }
+            if path.is_dir() && read_dir_has_sidebar(&path) {
+                let sub_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                let sub_path = if module_path.is_empty() {
+                    sub_name.to_string()
+                } else {
+                    format!("{}::{}", module_path, sub_name)
+                };
+                load_submodule(&path, crate_name, crate_dir_name, &sub_path, items);
             }
         }
     }
@@ -774,21 +916,17 @@ fn parse_sidebar_items_js(content: &str, out: &mut HashMap<String, Vec<String>>)
     }
 }
 
-/// Build the relative HTML path from the doc root to an item in a submodule.
-/// `dir` is the current submodule directory.
 fn build_html_rel_in_crate(dir: &Path, crate_dir_name: &str, kind: &str, name: &str) -> String {
     let mod_dir_rel = path_relative_to_crate_dir(dir, crate_dir_name);
     let suffix = html_filename_for_kind(kind, name);
     format!("{}/{}", mod_dir_rel, suffix)
 }
 
-/// Build the relative HTML path from the doc root for an item in a submodule all.html.
 fn build_submodule_html_rel(dir: &Path, crate_dir_name: &str, href: &str) -> String {
     let dir_rel = path_relative_to_crate_dir(dir, crate_dir_name);
     format!("{}/{}", dir_rel, href)
 }
 
-/// Get the relative path of a module directory from the crate doc directory.
 fn path_relative_to_crate_dir(dir: &Path, crate_dir_name: &str) -> String {
     let dir_name = dir
         .file_name()
@@ -797,7 +935,6 @@ fn path_relative_to_crate_dir(dir: &Path, crate_dir_name: &str) -> String {
     if dir_name == crate_dir_name {
         crate_dir_name.to_string()
     } else {
-        // Walk up from dir to find the crate dir and build relative path
         let mut components = Vec::new();
         let mut current = dir;
         loop {
@@ -861,7 +998,6 @@ fn clean_rendered_text(rendered: &str) -> String {
 
     for line in &lines {
         let trimmed = line.trim();
-        // Skip rustdoc chrome
         if trimmed == "Copy item path"
             || trimmed == "Expand description"
             || trimmed == "Run code"
@@ -885,8 +1021,6 @@ fn clean_rendered_text(rendered: &str) -> String {
         }
     }
 
-    // Clean up rustdoc chrome embedded in markdown text
-    // Note: rustdoc uses non-breaking spaces (U+00A0) in some places
     let nbsp = "\u{00a0}";
     output
         .replace(&format!("{nbsp}Copy item path"), "")
@@ -894,37 +1028,6 @@ fn clean_rendered_text(rendered: &str) -> String {
         .replace("**Expand description**", "")
         .replace(" Expand description", "")
         .replace(&format!("{nbsp}Expand description"), "")
-}
-
-/// Find the default doc root (rustup docs)
-pub fn default_doc_root() -> PathBuf {
-    let toolchain_output = std::process::Command::new("rustup")
-        .args(["show", "active-toolchain"])
-        .output()
-        .ok();
-    let toolchain = toolchain_output
-        .as_ref()
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.split_whitespace().next().map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| "stable".to_string());
-
-    let home = dirs::home_dir().unwrap_or_default();
-    let rustup_doc = home
-        .join(".rustup/toolchains")
-        .join(toolchain)
-        .join("share/doc/rust/html");
-
-    if rustup_doc.exists() {
-        rustup_doc
-    } else {
-        eprintln!(
-            "Could not find Rust docs at {}\nPass a path explicitly.",
-            rustup_doc.display()
-        );
-        std::process::exit(1);
-    }
 }
 
 /// Discover the doc HTML root from a given path.
