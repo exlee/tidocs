@@ -1,0 +1,545 @@
+use crate::docs::Registry;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    Frame,
+    layout::{Constraint, Layout, Margin, Rect},
+    style::{Color, Style, Stylize},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    Terminal,
+};
+use ratatui_markdown::{ThemeConfig, viewer::MarkdownViewer};
+use std::io::{self, Stdout};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Main TUI loop
+pub fn run(registry: Registry, doc_roots: Vec<PathBuf>) {
+    // Setup terminal
+    enable_raw_mode().expect("failed to enable raw mode");
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen).expect("failed to enter alt screen");
+    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).expect("failed to create terminal");
+
+    // Install SIGINT handler that restores the terminal before exiting
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    ctrlc::set_handler({
+        let running = Arc::clone(&running);
+        move || {
+            if running.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                // First Ctrl-C: restore terminal cleanly and exit
+                let _ = disable_raw_mode();
+                let mut out = io::stdout();
+                let _ = execute!(out, LeaveAlternateScreen);
+                let _ = execute!(out, crossterm::cursor::Show);
+                std::process::exit(130);
+            }
+        }
+    }).expect("failed to set Ctrl-C handler");
+
+    let result = run_app(&mut terminal, registry, doc_roots);
+
+    // Mark as stopped so a pending SIGINT doesn't double-restore
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // Restore terminal
+    disable_raw_mode().expect("failed to disable raw mode");
+    execute!(terminal.backend_mut(), LeaveAlternateScreen).expect("failed to leave alt screen");
+    terminal.show_cursor().expect("failed to show cursor");
+
+    if let Err(e) = result {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+enum AppMode {
+    Search,
+    Detail,
+    Help,
+}
+
+struct App {
+    mode: AppMode,
+    registry: Registry,
+    doc_roots: Vec<PathBuf>,
+    query: String,
+    items: Vec<usize>, // indices into registry
+    list_state: ListState,
+    detail_viewer: MarkdownViewer,
+    detail_md: String,
+    doc_theme: ThemeConfig,
+}
+
+fn run_app(
+    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
+    registry: Registry,
+    doc_roots: Vec<PathBuf>,
+) -> io::Result<()> {
+    let doc_theme = ThemeConfig::builder()
+        .with_text_color(Color::Rgb(200, 210, 220))
+        .with_muted_text_color(Color::Rgb(120, 140, 160))
+        .with_border_color(Color::Rgb(60, 80, 100))
+        .with_primary_color(Color::Rgb(200, 220, 240))
+        .with_secondary_color(Color::Rgb(100, 120, 140))
+        .build();
+
+    let mut app = App {
+        mode: AppMode::Search,
+        registry,
+        doc_roots,
+        query: String::new(),
+        items: Vec::new(),
+        list_state: ListState::default().with_selected(Some(0)),
+        detail_viewer: MarkdownViewer::new(),
+        detail_md: String::new(),
+        doc_theme,
+    };
+
+    loop {
+        terminal.draw(|f| render(f, &mut app))?;
+
+        if crossterm::event::poll(Duration::from_millis(50))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match app.mode {
+                AppMode::Search => {
+                    if key.code == KeyCode::Char('?') {
+                        app.mode = AppMode::Help;
+                        continue;
+                    }
+                    if let KeyCode::Char(c) = key.code {
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            match c {
+                                'c' | 'g' => break Ok(()),
+                                'u' => {
+                                    app.query.clear();
+                                    update_search(&mut app);
+                                }
+                                'w' => {
+                                    let trimmed = app.query.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_');
+                                    app.query.truncate(trimmed.len());
+                                    update_search(&mut app);
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            app.query.push(c);
+                            update_search(&mut app);
+                        }
+                    } else if handle_search_key(&mut app, key) {
+                        break Ok(());
+                    }
+                }
+                AppMode::Detail => handle_detail_key(&mut app, key),
+                AppMode::Help => {
+                    app.mode = AppMode::Search;
+                }
+            }
+        }
+    }
+}
+
+/// Synchronous multi-word substring search.
+/// Query is split by whitespace; each word must appear as a substring (case-insensitive)
+/// in the item path. Results are sorted by score, then alphabetically.
+fn update_search(app: &mut App) {
+    let words: Vec<&str> = app.query.split_whitespace().collect();
+    let all_items = app.registry.all_items();
+
+    if words.is_empty() {
+        app.items.clear();
+        app.list_state.select(None);
+        return;
+    }
+
+    let mut matches: Vec<(usize, i32)> = Vec::new();
+    for (i, item) in all_items.iter().enumerate() {
+        if let Some(score) = crate::docs::match_item_score(&item.path, &words) {
+            matches.push((i, score));
+        }
+    }
+    matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| all_items[a.0].path.cmp(&all_items[b.0].path)));
+    app.items = matches.into_iter().map(|(i, _)| i).collect();
+
+    if app.list_state.selected().is_some_and(|s| s >= app.items.len()) {
+        app.list_state.select(if app.items.is_empty() { None } else { Some(0) });
+    }
+
+    if let Some(selected) = app.list_state.selected() {
+        prefetch_around(app, selected);
+    }
+}
+
+/// Handle a key press in search mode. Returns true if the app should quit.
+fn handle_search_key(app: &mut App, key: event::KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Esc => {
+            if app.query.is_empty() {
+                return true;
+            }
+            app.query.clear();
+            update_search(app);
+        }
+        KeyCode::Enter => {
+            if let Some(selected) = app.list_state.selected()
+                && let Some(&idx) = app.items.get(selected)
+            {
+                let item = &app.registry.all_items()[idx];
+                app.detail_md = app.registry.load_doc_content(&item.html_rel);
+                app.detail_viewer.set_content(&app.detail_md, &app.doc_theme);
+                app.detail_viewer.scroll_to_top();
+                app.mode = AppMode::Detail;
+            }
+        }
+        KeyCode::Up => navigate_list(app, -1),
+        KeyCode::Down => navigate_list(app, 1),
+        KeyCode::PageUp => navigate_list(app, -15),
+        KeyCode::PageDown => navigate_list(app, 15),
+        KeyCode::Home => {
+            if !app.items.is_empty() {
+                app.list_state.select(Some(0));
+            }
+        }
+        KeyCode::End => {
+            if !app.items.is_empty() {
+                app.list_state.select(Some(app.items.len() - 1));
+            }
+        }
+        KeyCode::Backspace => {
+            app.query.pop();
+            update_search(app);
+        }
+        KeyCode::Delete => {
+            let end = app.query
+                .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_')
+                .len();
+            app.query.truncate(end);
+            update_search(app);
+        }
+        _ => {}
+    }
+    false
+}
+
+fn handle_detail_key(app: &mut App, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
+            app.mode = AppMode::Search;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.detail_viewer.scroll_up(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.detail_viewer.scroll_down(1);
+        }
+        KeyCode::PageUp => {
+            app.detail_viewer.page_up();
+        }
+        KeyCode::PageDown => {
+            app.detail_viewer.page_down();
+        }
+        _ if key.modifiers.contains(KeyModifiers::CONTROL) => match key.code {
+            KeyCode::Char('f') | KeyCode::Char('b') => {
+                app.detail_viewer.page_down();
+            }
+            KeyCode::Char('u') => {
+                app.detail_viewer.page_up();
+            }
+            _ => {}
+        },
+        KeyCode::Home => {
+            app.detail_viewer.scroll_to_top();
+        }
+        KeyCode::End => {
+            app.detail_viewer.scroll_to_bottom();
+        }
+        _ => {}
+    }
+}
+
+fn navigate_list(app: &mut App, delta: i32) {
+    if app.items.is_empty() {
+        return;
+    }
+    let current = app.list_state.selected().unwrap_or(0) as i32;
+    let new = (current + delta).clamp(0, (app.items.len() - 1) as i32) as usize;
+    app.list_state.select(Some(new));
+    prefetch_around(app, new);
+}
+
+fn prefetch_around(app: &App, center: usize) {
+    let all = app.registry.all_items();
+    let mut rels = Vec::new();
+    for &offset in &[-2i32, -1, 0, 1, 2] {
+        let idx = (center as i32 + offset).clamp(0, app.items.len() as i32 - 1) as usize;
+        if let Some(&item_idx) = app.items.get(idx) {
+            let rel = all[item_idx].html_rel.clone();
+            if !rels.contains(&rel) {
+                rels.push(rel);
+            }
+        }
+    }
+    app.registry.prefetch(rels);
+}
+
+fn render(f: &mut Frame, app: &mut App) {
+    let size = f.area();
+    f.render_widget(Clear, size);
+
+    match app.mode {
+        AppMode::Search => render_search(f, app, size),
+        AppMode::Detail => render_detail(f, app, size),
+        AppMode::Help => render_help(f, size),
+    }
+}
+
+fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
+    let chunks = Layout::vertical([
+        Constraint::Length(3),  // Search bar
+        Constraint::Length(1),  // Status
+        Constraint::Min(5),     // Item list
+        Constraint::Length(2),  // Footer
+    ])
+    .split(size);
+
+    // Search bar
+    let search_text = Text::from(vec![
+        Line::from(vec![
+            Span::styled(" / ", Style::default().fg(Color::Rgb(180, 80, 80))),
+            Span::raw(&app.query),
+        ]),
+    ]);
+    let search = Paragraph::new(search_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(100, 120, 140)))
+                .title(" clidoc "),
+        )
+        .style(Style::default().fg(Color::White));
+    f.render_widget(search, chunks[0]);
+
+    // Status line
+    let item_count = app.items.len();
+    let total = app.registry.all_items().len();
+    let status = Paragraph::new(Line::from(vec![
+        Span::raw(format!(
+            " {} items (from {} total)  [{}]",
+            item_count,
+            total,
+            app.doc_roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", ")
+        )),
+        Span::raw("  "),
+        Span::styled("[?] help", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+    ]))
+    .style(Style::default().fg(Color::Rgb(120, 140, 160)));
+    f.render_widget(status, chunks[1]);
+
+    // Item list
+    let list_items: Vec<ListItem> = app
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, &idx)| {
+            let item = &app.registry.all_items()[idx];
+            let selected = app.list_state.selected() == Some(i);
+            let (kind_color, kind_str) = kind_display(&item.kind);
+
+            let line = if selected {
+                Line::from(vec![
+                    Span::styled(format!(" {} ", kind_str), Style::default().fg(Color::Rgb(30, 30, 30)).bg(kind_color).bold()),
+                    Span::styled(format!(" {}", item.path), Style::default().fg(Color::Rgb(30, 30, 30)).bg(Color::Rgb(180, 210, 240))),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(format!(" {} ", kind_str), Style::default().fg(kind_color).bold()),
+                    Span::styled(format!(" {}", item.path), Style::default().fg(Color::Rgb(200, 210, 220))),
+                ])
+            };
+
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list = List::new(list_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Rgb(80, 100, 120))),
+    );
+    f.render_stateful_widget(list, chunks[2], &mut app.list_state);
+
+    // Scrollbar for list
+    if !app.items.is_empty() {
+        let max_scroll = app.items.len().saturating_sub(chunks[2].height as usize);
+        let selected = app.list_state.selected().unwrap_or(0);
+        let mut scrollbar_state = ScrollbarState::new(max_scroll).position(selected);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .style(Style::default().fg(Color::Rgb(80, 100, 120)))
+                .begin_symbol(Some("\u{25b2}"))
+                .end_symbol(Some("\u{25bc}")),
+            chunks[2].inner(Margin { vertical: 0, horizontal: 1 }),
+            &mut scrollbar_state,
+        );
+    }
+
+    // Footer with tooltip hint
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(" enter ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        Span::raw("detail  "),
+        Span::styled(" esc ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        Span::raw("quit/clear  "),
+        Span::styled(" C-u ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        Span::raw("clear  "),
+        Span::styled(" ? ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        Span::styled("how to add docs", Style::default().fg(Color::Rgb(100, 160, 100))),
+    ]))
+    .style(Style::default().fg(Color::Rgb(80, 100, 120)));
+    f.render_widget(footer, chunks[3]);
+}
+
+fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
+    let chunks = Layout::vertical([
+        Constraint::Length(3),  // Title bar
+        Constraint::Min(5),     // Content
+        Constraint::Length(2),  // Footer
+    ])
+    .split(size);
+
+    // Title bar
+    let title = if let Some(selected) = app.list_state.selected() {
+        if let Some(&idx) = app.items.get(selected) {
+            let item = &app.registry.all_items()[idx];
+            item.path.clone()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let title_bar = Paragraph::new(Line::from(vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(title, Style::default().fg(Color::Rgb(200, 220, 240)).bold()),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Rgb(80, 120, 160)))
+            .title(" doc "),
+    );
+    f.render_widget(title_bar, chunks[0]);
+
+    // Markdown content
+    app.detail_viewer.render(f, chunks[1], &app.doc_theme);
+
+    // Footer
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(" esc/q ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        Span::raw("back  "),
+        Span::styled(" j/k/\u{2191}/\u{2193} ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        Span::raw("scroll  "),
+        Span::styled(" C-g ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        Span::raw("quit"),
+    ]))
+    .style(Style::default().fg(Color::Rgb(80, 100, 120)));
+    f.render_widget(footer, chunks[2]);
+}
+
+fn render_help(f: &mut Frame, size: Rect) {
+    let help_lines = vec![
+        Line::from(Span::styled(
+            " How to add documentation sources",
+            Style::default().fg(Color::Rgb(200, 220, 240)).bold(),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" 1. Generate docs for your crate:", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "    cargo doc --no-deps        # generates target/doc/your_crate/",
+            Style::default().fg(Color::Rgb(200, 210, 220)),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" 2. Point clidoc at the HTML output:", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "    clidoc ./target/doc          # multi-crate root with all.html",
+            Style::default().fg(Color::Rgb(200, 210, 220)),
+        )),
+        Line::from(Span::styled(
+            "    clidoc ./target/doc/your_crate   # single crate dir",
+            Style::default().fg(Color::Rgb(200, 210, 220)),
+        )),
+        Line::from(Span::styled(
+            "    clidoc                         # default: rustup std docs",
+            Style::default().fg(Color::Rgb(200, 210, 220)),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" Requirements:", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "    The directory must contain 'all.html' or 'sidebar-items*.js'",
+            Style::default().fg(Color::Rgb(200, 210, 220)),
+        )),
+        Line::from(Span::styled(
+            "    (standard output of 'cargo doc')",
+            Style::default().fg(Color::Rgb(140, 160, 180)),
+        )),
+        Line::raw(""),
+        Line::styled(
+            " Press any key to close",
+            Style::default().fg(Color::Rgb(100, 120, 140)),
+        ),
+    ];
+
+    let help = Paragraph::new(help_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(80, 120, 160)))
+                .title(" How to add docs "),
+        );
+
+    // Center the help box
+    let popup_width = 56.min(size.width.saturating_sub(4));
+    let popup_height = 15.min(size.height.saturating_sub(4));
+    let x = (size.width.saturating_sub(popup_width)) / 2;
+    let y = (size.height.saturating_sub(popup_height)) / 2;
+    let area = Rect::new(x, y, popup_width, popup_height);
+
+    f.render_widget(Clear, area);
+    f.render_widget(help, area);
+}
+
+fn kind_display(kind: &str) -> (Color, &'static str) {
+    match kind {
+        "fn" | "method" => (Color::Rgb(86, 182, 194), "fn"),
+        "trait" => (Color::Rgb(180, 140, 220), "tr"),
+        "struct" => (Color::Rgb(130, 180, 120), "st"),
+        "enum" => (Color::Rgb(200, 160, 100), "en"),
+        "mod" => (Color::Rgb(120, 150, 200), "md"),
+        "macro" => (Color::Rgb(200, 120, 120), "ma"),
+        "type" | "assoc_type" => (Color::Rgb(160, 180, 140), "ty"),
+        "const" | "constant" | "assoc_const" => (Color::Rgb(200, 200, 130), "co"),
+        "primitive" => (Color::Rgb(140, 160, 180), "pr"),
+        "keyword" => (Color::Rgb(180, 140, 140), "kw"),
+        "reexport" => (Color::Rgb(150, 150, 150), ">>"),
+        _ => (Color::Rgb(150, 150, 150), "??"),
+    }
+}
