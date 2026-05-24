@@ -1,4 +1,4 @@
-use crate::docs::{DocSource, Registry};
+use crate::docs::{has_uppercase, kind_badge_to_kinds, match_item_score, DocSource, Registry};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
@@ -14,7 +14,8 @@ use ratatui::{
 };
 use ratatui_markdown::{ThemeConfig, viewer::MarkdownViewer};
 use std::io::{self, Stdout};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::Duration;
 
 /// Main TUI loop
@@ -64,6 +65,19 @@ enum AppMode {
     Help,
 }
 
+/// Message sent from the search thread to the main loop.
+/// Message sent from main loop to search worker.
+struct SearchRequest {
+    id: u64,
+    query: String,
+}
+
+/// Message sent from search worker to main loop.
+struct SearchReply {
+    id: u64,
+    indices: Vec<usize>,
+}
+
 struct App {
     mode: AppMode,
     registry: Registry,
@@ -74,6 +88,12 @@ struct App {
     detail_viewer: MarkdownViewer,
     detail_md: String,
     doc_theme: ThemeConfig,
+    /// Send search requests to the worker.
+    tx: mpsc::Sender<SearchRequest>,
+    /// Receive search results from the worker.
+    rx: mpsc::Receiver<SearchReply>,
+    /// Monotonically increasing ID for each search request.
+    search_id: u64,
 }
 
 fn run_app(
@@ -89,6 +109,17 @@ fn run_app(
         .with_secondary_color(Color::Rgb(100, 120, 140))
         .build();
 
+    // Spawn dedicated search thread with (path, kind) tuples
+    let all_items: Vec<(String, String)> = registry.all_items()
+        .iter()
+        .map(|item| (item.path.clone(), item.kind.clone()))
+        .collect();
+    let (tx_req, rx_req) = mpsc::channel::<SearchRequest>();
+    let (tx_rep, rx_rep) = mpsc::channel::<SearchReply>();
+    thread::spawn(move || {
+        search_worker(all_items, rx_req, tx_rep)
+    });
+
     let mut app = App {
         mode: AppMode::Search,
         registry,
@@ -99,12 +130,18 @@ fn run_app(
         detail_viewer: MarkdownViewer::new(),
         detail_md: String::new(),
         doc_theme,
+        tx: tx_req,
+        rx: rx_rep,
+        search_id: 0,
     };
 
     loop {
+        // Drain any completed search results before drawing
+        drain_results(&mut app);
+
         terminal.draw(|f| render(f, &mut app))?;
 
-        if crossterm::event::poll(Duration::from_millis(50))?
+        if crossterm::event::poll(Duration::from_millis(33))?
             && let Event::Key(key) = event::read()?
         {
             if key.kind != KeyEventKind::Press {
@@ -122,18 +159,18 @@ fn run_app(
                                 'c' | 'g' => break Ok(()),
                                 'u' => {
                                     app.query.clear();
-                                    update_search(&mut app);
+                                    submit_search(&mut app);
                                 }
                                 'w' => {
                                     let trimmed = app.query.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_');
                                     app.query.truncate(trimmed.len());
-                                    update_search(&mut app);
+                                    submit_search(&mut app);
                                 }
                                 _ => {}
                             }
                         } else {
                             app.query.push(c);
-                            update_search(&mut app);
+                            submit_search(&mut app);
                         }
                     } else if handle_search_key(&mut app, key) {
                         break Ok(());
@@ -148,34 +185,78 @@ fn run_app(
     }
 }
 
-/// Synchronous multi-word substring search.
-/// Query is split by whitespace; each word must appear as a substring (case-insensitive)
-/// in the item path. Results are sorted by score, then alphabetically.
-fn update_search(app: &mut App) {
-    let words: Vec<&str> = app.query.split_whitespace().collect();
-    let all_items = app.registry.all_items();
-
-    if words.is_empty() {
-        app.items.clear();
-        app.list_state.select(None);
-        return;
+/// Dedicated background thread that runs substring searches.
+fn search_worker(
+    all_items: Vec<(String, String)>, // (path, kind)
+    rx_req: mpsc::Receiver<SearchRequest>,
+    tx_rep: mpsc::Sender<SearchReply>,
+) {
+    while let Ok(SearchRequest { id, query }) = rx_req.recv() {
+        // Check for leading kind badge
+        let (kind_filter, rest_query): (Option<Vec<String>>, String) = if let Some(space_pos) = query.find(' ') {
+            let badge = &query[..space_pos];
+            let kinds = kind_badge_to_kinds(badge);
+            if !kinds.is_empty() {
+                (Some(kinds), query[space_pos + 1..].to_string())
+            } else {
+                (None, query.clone())
+            }
+        } else {
+            (None, query.clone())
+        };
+        let words: Vec<&str> = rest_query.split_whitespace().collect();
+        let case_sensitive = has_uppercase(&rest_query);
+        let indices = if words.is_empty() {
+            Vec::new()
+        } else {
+            let mut matches: Vec<(usize, i32)> = Vec::new();
+            for (i, (path, kind)) in all_items.iter().enumerate() {
+                if let Some(ref kf) = kind_filter {
+                    if !kf.contains(kind) {
+                        continue;
+                    }
+                }
+                if let Some(score) = match_item_score(path, kind, &words, case_sensitive) {
+                    matches.push((i, score));
+                }
+            }
+            matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| all_items[a.0].0.cmp(&all_items[b.0].0)));
+            matches.into_iter().map(|(i, _)| i).collect()
+        };
+        let _ = tx_rep.send(SearchReply { id, indices });
     }
+}
 
-    let mut matches: Vec<(usize, i32)> = Vec::new();
-    for (i, item) in all_items.iter().enumerate() {
-        if let Some(score) = crate::docs::match_item_score(&item.path, &words) {
-            matches.push((i, score));
+/// Submit a new async search request.
+fn submit_search(app: &mut App) {
+    app.search_id += 1;
+    let id = app.search_id;
+    let query = app.query.clone();
+    let _ = app.tx.send(SearchRequest { id, query });
+}
+
+/// Drain completed search results from the channel and apply the latest one.
+fn drain_results(app: &mut App) {
+    // Collect all pending replies
+    let mut pending: Vec<SearchReply> = Vec::new();
+    loop {
+        match app.rx.try_recv() {
+            Ok(reply) => pending.push(reply),
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => return,
         }
     }
-    matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| all_items[a.0].path.cmp(&all_items[b.0].path)));
-    app.items = matches.into_iter().map(|(i, _)| i).collect();
-
-    if app.list_state.selected().is_some_and(|s| s >= app.items.len()) {
-        app.list_state.select(if app.items.is_empty() { None } else { Some(0) });
-    }
-
-    if let Some(selected) = app.list_state.selected() {
-        prefetch_around(app, selected);
+    // Apply only the reply matching our current search_id
+    for reply in pending {
+        if reply.id == app.search_id {
+            app.items = reply.indices;
+            if app.list_state.selected().is_some_and(|s| s >= app.items.len()) {
+                app.list_state.select(if app.items.is_empty() { None } else { Some(0) });
+            }
+            if let Some(selected) = app.list_state.selected() {
+                prefetch_around(app, selected);
+            }
+        }
     }
 }
 
@@ -187,7 +268,7 @@ fn handle_search_key(app: &mut App, key: event::KeyEvent) -> bool {
                 return true;
             }
             app.query.clear();
-            update_search(app);
+            submit_search(app);
         }
         KeyCode::Enter => {
             if let Some(selected) = app.list_state.selected()
@@ -216,14 +297,14 @@ fn handle_search_key(app: &mut App, key: event::KeyEvent) -> bool {
         }
         KeyCode::Backspace => {
             app.query.pop();
-            update_search(app);
+            submit_search(app);
         }
         KeyCode::Delete => {
             let end = app.query
                 .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_')
                 .len();
             app.query.truncate(end);
-            update_search(app);
+            submit_search(app);
         }
         _ => {}
     }
@@ -311,11 +392,13 @@ fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
     ])
     .split(size);
 
-    // Search bar
+    // Search bar with blinking cursor block
+    let cursor_char = "█";
     let search_text = Text::from(vec![
         Line::from(vec![
             Span::styled(" / ", Style::default().fg(Color::Rgb(180, 80, 80))),
             Span::raw(&app.query),
+            Span::styled(cursor_char, Style::default().fg(Color::Rgb(180, 80, 80))),
         ]),
     ]);
     let search = Paragraph::new(search_text)
@@ -333,10 +416,10 @@ fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
     let total = app.registry.all_items().len();
     let status = Paragraph::new(Line::from(vec![
         Span::raw(format!(
-            " {} items (from {} total)  [{}]",
+            " {} items (from {} total) - {} sources",
             item_count,
             total,
-            app.sources.iter().map(|s| s.label()).collect::<Vec<_>>().join(", ")
+            app.sources.len(),
         )),
         Span::raw("  "),
         Span::styled("[?] help", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),

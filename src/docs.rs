@@ -1,4 +1,6 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -60,6 +62,8 @@ impl DocSource {
 pub struct Registry {
     items: Vec<DocItem>,
     doc_roots: Vec<PathBuf>,
+    /// Maps crate dir prefix (e.g. "std") to (lib_name, version) for DB lookups.
+    source_map: HashMap<String, (String, String)>,
     content_cache: Arc<Mutex<HashMap<String, String>>>,
     runtime: tokio::runtime::Handle,
 }
@@ -97,15 +101,25 @@ impl Registry {
 
         let mut all_items = Vec::new();
         let mut active_sources = Vec::new();
+        // Maps crate-dir-prefix (first component of html_rel) -> (lib_name, version)
+        let mut source_map: HashMap<String, (String, String)> = HashMap::new();
 
         for source in &sources {
             let source_key = source_key(&source.lib_name, &source.version);
+            let crate_dir_prefix = source.path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            source_map.insert(crate_dir_prefix.clone(), (source.lib_name.clone(), source.version.clone()));
+
             if db_needs_scan(&source.lib_name, &source.version, &source.path) {
                 let mut items = Vec::new();
                 load_crate(&source.path, &source.lib_name, &mut items);
                 items.sort_by(|a, b| a.path.cmp(&b.path));
                 items.dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
                 db_save_items(&source_key, &source.path, &source.lib_name, &source.version, &items);
+                // Cache HTML pages into DB
+                cache_pages_for_items(&crate_dir_prefix, &source.lib_name, &source.version, &source.path, &items);
                 all_items.extend(items);
             } else {
                 if let Some(cached) = db_load_items(&source_key) {
@@ -120,10 +134,10 @@ impl Registry {
         eprintln!("[clidoc] total: {} items", all_items.len());
 
         let roots: Vec<PathBuf> = active_sources.iter().map(|s| s.path.clone()).collect();
-        (Self::new(all_items, roots), active_sources)
+        (Self::new(all_items, roots, source_map), active_sources)
     }
 
-    fn new(items: Vec<DocItem>, doc_roots: Vec<PathBuf>) -> Self {
+    fn new(items: Vec<DocItem>, doc_roots: Vec<PathBuf>, source_map: HashMap<String, (String, String)>) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -134,18 +148,94 @@ impl Registry {
         Self {
             items,
             doc_roots,
+            source_map,
             content_cache: Arc::new(Mutex::new(HashMap::new())),
             runtime: handle,
         }
     }
 
+    /// Merge cached sources from DB into this registry.
+    /// Used when filesystem discovery yields no sources but DB has cached data.
+    pub fn merge_cached(&mut self) -> Vec<DocSource> {
+        let conn = match rusqlite::Connection::open(&db_path()) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        db_ensure_tables(&conn);
+
+        let mut stmt = match conn.prepare(
+            "SELECT lib_name, version FROM sources"
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap_or_else(|_| panic!("failed to query sources"))
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut new_sources = Vec::new();
+        for (lib_name, version) in rows {
+            // Skip if already loaded
+            if self.source_map.values().any(|(l, v)| l == &lib_name && v == &version) {
+                continue;
+            }
+            let key = source_key(&lib_name, &version);
+            if let Some(items) = db_load_items(&key) {
+                let crate_prefix = lib_name.clone();
+                self.source_map.insert(crate_prefix, (lib_name.clone(), version.clone()));
+                self.items.extend(items);
+                let path_str: String = conn.query_row(
+                    "SELECT path FROM sources WHERE lib_name = ?1 AND version = ?2",
+                    params![&lib_name, &version],
+                    |row| row.get(0),
+                ).unwrap_or_default();
+                let path = PathBuf::from(&path_str);
+                let parent = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.clone());
+                if !self.doc_roots.contains(&parent) {
+                    self.doc_roots.push(parent);
+                }
+                new_sources.push(DocSource {
+                    lib_name,
+                    version,
+                    path,
+                });
+            }
+        }
+
+        self.items.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.kind.cmp(&b.kind)));
+        self.items.dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
+        eprintln!("[clidoc] total: {} items", self.items.len());
+        new_sources
+    }
+
     pub fn search(&self, query: &str, limit: usize) -> Vec<&DocItem> {
-        let words: Vec<&str> = query.split_whitespace().collect();
+        // Check for leading kind badge (e.g. "fn peek", "st HashMap")
+        let (kind_filter, rest_query) = if let Some(space_pos) = query.find(' ') {
+            let badge = &query[..space_pos];
+            let kinds = kind_badge_to_kinds(badge);
+            if !kinds.is_empty() {
+                (Some(kinds), &query[space_pos + 1..])
+            } else {
+                (None, query)
+            }
+        } else {
+            (None, query)
+        };
+        let words: Vec<&str> = rest_query.split_whitespace().collect();
+        let case_sensitive = has_uppercase(rest_query);
         let mut scored: Vec<_> = self
             .items
             .iter()
             .filter_map(|item| {
-                let score = match_item_score(&item.path, &words)?;
+                if let Some(ref kf) = kind_filter {
+                    if !kf.contains(&item.kind) {
+                        return None;
+                    }
+                }
+                let score = match_item_score(&item.path, &item.kind, &words, case_sensitive)?;
                 Some((item, score))
             })
             .collect();
@@ -162,7 +252,20 @@ impl Registry {
         if let Some(cached) = self.content_cache.lock().unwrap().get(html_rel) {
             return cached.clone();
         }
-        let content = self.convert_html(html_rel);
+        // Resolve which source this belongs to via the first path component
+        let file_rel = html_rel.split('#').next().unwrap_or(html_rel);
+        let crate_prefix = file_rel.split('/').next().unwrap_or("");
+
+        // Try DB cache first
+        let content = if let Some((lib_name, version)) = self.source_map.get(crate_prefix) {
+            db_load_page_html(lib_name, version, html_rel)
+                .as_deref()
+                .map(|s| render_doc_page(s))
+        } else {
+            None
+        };
+
+        let content = content.unwrap_or_else(|| self.convert_html(html_rel));
         self.content_cache.lock().unwrap().insert(html_rel.to_string(), content.clone());
         content
     }
@@ -179,19 +282,16 @@ impl Registry {
                     }
                 }
                 let file_rel = rel.split('#').next().unwrap_or("").to_string();
-                let mut loaded = false;
-                for root in &roots {
+                'roots: for root in &roots {
                     let html_path = root.join(&file_rel);
                     if !html_path.exists() { continue; }
                     let Ok(raw) = fs::read_to_string(&html_path) else { continue; };
                     let content = render_doc_page(&raw);
                     cache.lock().unwrap().insert(rel.clone(), content);
-                    loaded = true;
-                    break;
+                    break 'roots;
                 }
-                if !loaded {
-                    cache.lock().unwrap().insert(rel, format!("Documentation not found: {}", file_rel));
-                }
+                // Don't insert "not found" poison into cache.
+                // If we can't resolve it now, let on-demand load try DB or filesystem.
             }
         });
     }
@@ -241,8 +341,94 @@ fn db_ensure_tables(conn: &rusqlite::Connection) {
             html_rel TEXT NOT NULL,
             desc     TEXT,
             PRIMARY KEY (lib_name, version, path, kind)
+        );
+        CREATE TABLE IF NOT EXISTS pages (
+            lib_name TEXT NOT NULL,
+            version  TEXT NOT NULL,
+            html_rel TEXT NOT NULL,
+            html     BLOB NOT NULL,
+            PRIMARY KEY (lib_name, version, html_rel)
         );"
     );
+}
+
+/// Compress a string with zlib deflate.
+fn compress(text: &str) -> Option<Vec<u8>> {
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(text.as_bytes()).ok()?
+    ;
+    Some(encoder.finish().ok()?)
+}
+
+/// Decompress zlib-deflated bytes back to string.
+fn decompress(data: &[u8]) -> Option<String> {
+    let mut decoder = flate2::read::ZlibDecoder::new(data);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok()?;
+    String::from_utf8(out).ok()
+}
+
+/// Load raw HTML from DB cache (compressed).
+fn db_load_page_html(lib_name: &str, version: &str, html_rel: &str) -> Option<String> {
+    let conn = rusqlite::Connection::open(&db_path()).ok()?;
+    db_ensure_tables(&conn);
+    let file_rel = html_rel.split('#').next().unwrap_or(html_rel);
+    let mut stmt = conn.prepare(
+        "SELECT html FROM pages WHERE lib_name = ?1 AND version = ?2 AND html_rel = ?3"
+    ).ok()?;
+    let data: Vec<u8> = stmt.query_row(params![lib_name, version, file_rel], |row| row.get(0)).ok()?;
+    decompress(&data)
+}
+
+/// Cache all unique HTML pages referenced by items.
+fn cache_pages_for_items(_crate_prefix: &str, lib_name: &str, version: &str, crate_dir: &Path, items: &[DocItem]) {
+    // Collect unique base HTML files (strip fragment anchors)
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut html_files: Vec<&str> = Vec::new();
+    for item in items {
+        let file_rel = item.html_rel.split('#').next().unwrap_or(&item.html_rel);
+        if seen.insert(file_rel) {
+            html_files.push(file_rel);
+        }
+    }
+
+    // Resolve against the doc root (parent of crate dir)
+    let doc_root = crate_dir.parent().unwrap_or(crate_dir);
+
+    let mut conn = match rusqlite::Connection::open(&db_path()) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    db_ensure_tables(&conn);
+
+    // Delete old pages for this source
+    let _ = conn.execute(
+        "DELETE FROM pages WHERE lib_name = ?1 AND version = ?2",
+        params![lib_name, version],
+    );
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(_) => return,
+    };
+    {
+        let mut stmt = match tx.prepare(
+            "INSERT INTO pages (lib_name, version, html_rel, html) VALUES (?1, ?2, ?3, ?4)"
+        ) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        for file_rel in html_files {
+            let path = doc_root.join(file_rel);
+            let Ok(raw) = fs::read_to_string(&path) else { continue; };
+            let compressed = match compress(&raw) {
+                Some(c) => c,
+                None => continue,
+            };
+            let _ = stmt.execute(params![lib_name, version, file_rel, compressed]);
+        }
+    }
+    let _ = tx.commit();
 }
 
 fn compute_fingerprint(crate_dir: &Path) -> Option<String> {
@@ -288,7 +474,15 @@ fn db_needs_scan(lib_name: &str, version: &str, crate_dir: &Path) -> bool {
 
     let fp = match compute_fingerprint(crate_dir) {
         Some(fp) => fp,
-        None => return true,
+        None => {
+            // Files not on disk -- check if we have cached data to fall back on
+            let has_cache: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sources WHERE lib_name = ?1 AND version = ?2)",
+                params![lib_name, version],
+                |row| row.get(0),
+            ).unwrap_or(false);
+            return !has_cache; // needs_scan=false if cache exists
+        }
     };
 
     let stored: Option<String> = conn
@@ -511,20 +705,68 @@ fn discover_doc_sources() -> Vec<DocSource> {
 
 /// Multi-word substring match. Each word must appear as a case-insensitive substring.
 /// Returns a score (higher = better) or None if any word is missing.
-pub(crate) fn match_item_score(path: &str, words: &[&str]) -> Option<i32> {
-    let path_lower = path.to_lowercase();
+/// Returns true if the query contains any uppercase ASCII letter.
+/// Map a 2-letter kind badge back to internal kind strings.
+/// Returns owned Strings for easy ownership transfer.
+pub(crate) fn kind_badge_to_kinds(badge: &str) -> Vec<String> {
+    match badge {
+        "fn" => vec!["fn".into(), "method".into()],
+        "tr" => vec!["trait".into()],
+        "st" => vec!["struct".into()],
+        "en" => vec!["enum".into()],
+        "md" => vec!["mod".into()],
+        "ma" => vec!["macro".into()],
+        "ty" => vec!["type".into(), "assoc_type".into()],
+        "co" => vec!["const".into(), "constant".into(), "assoc_const".into()],
+        "pr" => vec!["primitive".into()],
+        "kw" => vec!["keyword".into()],
+        ">>" => vec!["reexport".into()],
+        _ => vec![],
+    }
+}
+
+/// Returns true if the query contains any uppercase ASCII letter.
+pub(crate) fn has_uppercase(query: &str) -> bool {
+    query.chars().any(|c| c.is_ascii_uppercase())
+}
+
+pub(crate) fn match_item_score(path: &str, _kind: &str, words: &[&str], case_sensitive: bool) -> Option<i32> {
+    let (search_path, needs_lower) = if case_sensitive {
+        (Cow::Borrowed(path), false)
+    } else {
+        (Cow::Owned(path.to_lowercase()), true)
+    };
     let mut total_score: i32 = 0;
     for &word in words {
-        let word_lower = word.to_lowercase();
-        let pos = path_lower.find(&word_lower)?;
-        if pos == 0 {
-            total_score += 100;
+        let search_word = if needs_lower {
+            Cow::Owned(word.to_lowercase())
         } else {
-            let prev = path_lower.as_bytes()[pos - 1];
-            if prev == b':' || prev == b'_' {
-                total_score += 80;
+            Cow::Borrowed(word)
+        };
+        let pos = search_path.find(search_word.as_ref())?;
+
+        // Bonus: if case-insensitive mode but the matched slice in the original
+        // path already matches the query word's exact casing, it's a better hit.
+        let case_match_bonus = if !case_sensitive {
+            let matched_in_path = &path[pos..pos + word.len()];
+            if matched_in_path == word {
+                // Exact case match despite insensitive search — strong signal
+                50
             } else {
-                total_score += 10;
+                0
+            }
+        } else {
+            0
+        };
+
+        if pos == 0 {
+            total_score += 100 + case_match_bonus;
+        } else {
+            let prev = search_path.as_bytes()[pos - 1];
+            if prev == b':' || prev == b'_' {
+                total_score += 80 + case_match_bonus;
+            } else {
+                total_score += 10 + case_match_bonus;
             }
         }
     }
@@ -892,7 +1134,19 @@ pub fn render_doc_page(html: &str) -> String {
         html
     };
 
-    match html_to_markdown_rs::convert(main_content, None) {
+    let options = html_to_markdown_rs::ConversionOptions::builder()
+        .strip_tags(vec!["a".into()])       // keep link text, drop [text](url)
+        .exclude_selectors(vec![
+            ".anchor".into(),               // rustdoc § anchors
+            "#rustdoc-nav".into(),          // sidebar nav
+            ".sidebar-links".into(),        // sidebar links
+            ".location".into(),             // breadcrumb location
+        ])
+        .wrap(true)
+        .wrap_width(80)
+        .build();
+
+    match html_to_markdown_rs::convert(main_content, Some(options)) {
         Ok(result) => clean_rendered_text(result.content.as_deref().unwrap_or("")),
         Err(e) => format!("Failed to render HTML: {e}"),
     }
@@ -902,22 +1156,32 @@ fn clean_rendered_text(rendered: &str) -> String {
     let lines: Vec<&str> = rendered.lines().collect();
     let mut output = String::new();
     let mut prev_blank = false;
+    let mut in_code_block = false;
 
     for line in &lines {
-        let trimmed = line.trim();
-        if trimmed == "Copy item path"
-            || trimmed == "Expand description"
-            || trimmed == "Run code"
-            || (trimmed.starts_with("[](https://play.rust-lang.org") && trimmed.ends_with(')'))
-            || (trimmed.starts_with("[](https://doc.rust-lang.org") && trimmed.ends_with(')'))
+        // Track fenced code blocks
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+        }
+
+        let text = if in_code_block {
+            *line  // preserve indentation inside code blocks
+        } else {
+            line.trim()
+        };
+
+        if text == "Copy item path"
+            || text == "Expand description"
+            || text == "Run code"
+            || (text.starts_with("[](") && text.ends_with(')'))
         {
             continue;
         }
-        if trimmed.is_empty() {
+        if text.is_empty() {
             if !prev_blank { output.push('\n'); prev_blank = true; }
         } else {
             if prev_blank && !output.is_empty() { output.push('\n'); }
-            output.push_str(trimmed);
+            output.push_str(text);
             output.push('\n');
             prev_blank = false;
         }
@@ -930,6 +1194,7 @@ fn clean_rendered_text(rendered: &str) -> String {
         .replace("**Expand description**", "")
         .replace(" Expand description", "")
         .replace(&format!("{nbsp}Expand description"), "")
+        .replace('§', "")
 }
 
 /// Discover the doc HTML root from a given path.

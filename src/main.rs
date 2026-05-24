@@ -24,7 +24,13 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    let (registry, sources) = docs::Registry::load(&cli.paths);
+    let (mut registry, mut sources) = docs::Registry::load(&cli.paths);
+
+    // If filesystem discovery yielded nothing, try loading from DB cache
+    if registry.all_items().is_empty() {
+        let cached = registry.merge_cached();
+        sources.extend(cached);
+    }
 
     match cli.query {
         Some(query) => {
