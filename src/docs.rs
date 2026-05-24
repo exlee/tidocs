@@ -207,7 +207,9 @@ impl Registry {
 
         self.items.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.kind.cmp(&b.kind)));
         self.items.dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
-        eprintln!("[clidoc] total: {} items", self.items.len());
+        if !new_sources.is_empty() {
+            // Already printed total above; just note what was added
+        }
         new_sources
     }
 
