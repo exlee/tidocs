@@ -1136,6 +1136,17 @@ pub fn render_doc_page(html: &str) -> String {
         html
     };
 
+    // Normalize h2→h1 and h4→h3 so MarkdownViewer renders them with distinct colors.
+    // H2 uses text_color (same as body = grey), so we avoid H2 entirely:
+    //   H1 = primary_color (bright blue, bold+underlined)
+    //   H3 = secondary_color (warm orange, bold)
+    // Also fix bold-wrapped headings (**### ...** → ### ...).
+    let preprocessed = main_content
+        .replace("<h2", "<h1")
+        .replace("</h2>", "</h1>")
+        .replace("<h4", "<h3")
+        .replace("</h4>", "</h3>");
+
     let options = html_to_markdown_rs::ConversionOptions::builder()
         .strip_tags(vec!["a".into()])       // keep link text, drop [text](url)
         .exclude_selectors(vec![
@@ -1146,7 +1157,7 @@ pub fn render_doc_page(html: &str) -> String {
         ])
         .build();
 
-    match html_to_markdown_rs::convert(main_content, Some(options)) {
+    match html_to_markdown_rs::convert(&preprocessed, Some(options)) {
         Ok(result) => clean_rendered_text(result.content.as_deref().unwrap_or("")),
         Err(e) => format!("Failed to render HTML: {e}"),
     }
@@ -1168,6 +1179,13 @@ fn clean_rendered_text(rendered: &str) -> String {
             *line  // preserve indentation inside code blocks
         } else {
             line.trim()
+        };
+
+        // Unwrap bold-wrapped headings: **### ...** → ### ...
+        let text = if text.starts_with("**#") && text.ends_with("**") && text.contains(" ") {
+            &text[2..text.len() - 2]
+        } else {
+            text
         };
 
         if text == "Copy item path"

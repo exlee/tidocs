@@ -98,8 +98,8 @@ struct App {
 }
 
 impl App {
-    /// Rebuild the detail viewer if terminal width changed.
-    fn recreate_detail_viewer(&mut self, width: usize) {
+    /// Rebuild the detail viewer if terminal width changed or content changed.
+    fn ensure_detail_viewer(&mut self, width: usize) {
         if self.detail_width != width {
             self.detail_viewer = MarkdownViewer::new().with_max_width(width);
             self.detail_viewer.set_content(&self.detail_md, &self.doc_theme);
@@ -117,8 +117,9 @@ fn run_app(
         .with_text_color(Color::Rgb(200, 210, 220))
         .with_muted_text_color(Color::Rgb(120, 140, 160))
         .with_border_color(Color::Rgb(60, 80, 100))
-        .with_primary_color(Color::Rgb(200, 220, 240))
-        .with_secondary_color(Color::Rgb(100, 120, 140))
+        .with_primary_color(Color::Rgb(130, 200, 255))    // H1: bright blue + bold + underline
+        .with_secondary_color(Color::Rgb(255, 180, 100))  // H3: warm orange + bold
+        .with_info_color(Color::Rgb(180, 255, 180))       // H2: green-tinted
         .build();
 
     // Spawn dedicated search thread with (path, kind) tuples
@@ -289,11 +290,15 @@ fn handle_search_key(app: &mut App, key: event::KeyEvent) -> bool {
             {
                 let item = &app.registry.all_items()[idx];
                 app.detail_md = app.registry.load_doc_content(&item.html_rel);
-                app.detail_viewer.scroll_to_top();
+                app.detail_width = 0; // force rebuild on next render
                 app.mode = AppMode::Detail;
             }
         }
-        KeyCode::Up => navigate_list(app, -1),
+        KeyCode::Up => {
+            if app.list_state.selected().is_some() {
+                navigate_list(app, -1);
+            }
+        }
         KeyCode::Down => navigate_list(app, 1),
         KeyCode::PageUp => navigate_list(app, -15),
         KeyCode::PageDown => navigate_list(app, 15),
@@ -325,7 +330,7 @@ fn handle_search_key(app: &mut App, key: event::KeyEvent) -> bool {
 
 fn handle_detail_key(app: &mut App, key: event::KeyEvent) {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
+        KeyCode::Esc | KeyCode::Char('q') => {
             app.mode = AppMode::Search;
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -334,10 +339,10 @@ fn handle_detail_key(app: &mut App, key: event::KeyEvent) {
         KeyCode::Down | KeyCode::Char('j') => {
             app.detail_viewer.scroll_down(1);
         }
-        KeyCode::PageUp => {
+        KeyCode::PageUp | KeyCode::Backspace => {
             app.detail_viewer.page_up();
         }
-        KeyCode::PageDown => {
+        KeyCode::PageDown | KeyCode::Char(' ') => {
             app.detail_viewer.page_down();
         }
         _ if key.modifiers.contains(KeyModifiers::CONTROL) => match key.code {
@@ -407,7 +412,7 @@ fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
         Constraint::Length(3),  // Search bar
         Constraint::Length(1),  // Status
         Constraint::Min(5),     // Item list
-        Constraint::Length(2),  // Footer
+        Constraint::Length(1),  // Footer
     ])
     .split(size);
 
@@ -440,8 +445,6 @@ fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
             total,
             app.sources.len(),
         )),
-        Span::raw("  "),
-        Span::styled("[?] help", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
     ]))
     .style(Style::default().fg(Color::Rgb(120, 140, 160)));
     f.render_widget(status, chunks[1]);
@@ -494,16 +497,14 @@ fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
         );
     }
 
-    // Footer with tooltip hint
+    // Footer with key hints
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(" enter ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
         Span::raw("detail  "),
         Span::styled(" esc ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
         Span::raw("quit/clear  "),
         Span::styled(" C-u ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
-        Span::raw("clear  "),
-        Span::styled(" ? ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
-        Span::styled("how to add docs", Style::default().fg(Color::Rgb(100, 160, 100))),
+        Span::raw("clear"),
     ]))
     .style(Style::default().fg(Color::Rgb(80, 100, 120)));
     f.render_widget(footer, chunks[3]);
@@ -513,7 +514,7 @@ fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
     let chunks = Layout::vertical([
         Constraint::Length(3),  // Title bar
         Constraint::Min(5),     // Content
-        Constraint::Length(2),  // Footer
+        Constraint::Length(1),  // Footer
     ])
     .split(size);
 
@@ -543,19 +544,19 @@ fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
 
     // Recreate viewer if terminal resized
     let avail_width = chunks[1].width as usize;
-    app.recreate_detail_viewer(avail_width);
+    app.ensure_detail_viewer(avail_width);
 
     // Markdown content
     app.detail_viewer.render(f, chunks[1], &app.doc_theme);
 
-    // Footer
+    // Footer with key hints
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(" esc/q ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
         Span::raw("back  "),
-        Span::styled(" j/k/\u{2191}/\u{2193} ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        Span::styled(" j/k/↑/↓ ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
         Span::raw("scroll  "),
-        Span::styled(" C-g ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
-        Span::raw("quit"),
+        Span::styled(" space/backspace ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        Span::raw("page"),
     ]))
     .style(Style::default().fg(Color::Rgb(80, 100, 120)));
     f.render_widget(footer, chunks[2]);
