@@ -1,61 +1,76 @@
-use crate::docs::{has_uppercase, kind_badge_to_kinds, match_item_score, DocSource, Registry};
+use crate::docs::{DocSource, Registry, has_uppercase, kind_badge_to_kinds, match_item_score};
 use crossterm::{
+    cursor::Show,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
-    Frame,
+    Frame, Terminal,
     layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
-    Terminal,
+    widgets::{
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
+    },
 };
 use std::io::{self, Stdout};
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
-use tui_markdown::{from_str_with_options, Options, StyleSheet};
+use tui_markdown::{Options, StyleSheet, from_str_with_options};
 
 /// Main TUI loop
+/// Guard that restores the terminal on Drop (normal exit, panic, or signal).
+/// Installed immediately after enabling raw mode + entering alternate screen.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn new() -> Self {
+        enable_raw_mode().expect("failed to enable raw mode");
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen).expect("failed to enter alt screen");
+        TerminalGuard
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen);
+        let _ = execute!(stdout, Show);
+    }
+}
+
 pub fn run(registry: Registry, sources: Vec<DocSource>) {
-    // Setup terminal
-    enable_raw_mode().expect("failed to enable raw mode");
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).expect("failed to enter alt screen");
+    // Guard ensures terminal is always restored (panic, signal, or normal exit).
+    let _guard = TerminalGuard::new();
+    let stdout = io::stdout();
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).expect("failed to create terminal");
 
-    // Install SIGINT handler that restores the terminal before exiting
-    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    ctrlc::set_handler({
-        let running = Arc::clone(&running);
-        move || {
-            if running.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                // First Ctrl-C: restore terminal cleanly and exit
-                let _ = disable_raw_mode();
-                let mut out = io::stdout();
-                let _ = execute!(out, LeaveAlternateScreen);
-                let _ = execute!(out, crossterm::cursor::Show);
-                std::process::exit(130);
-            }
+    // Install SIGINT handler — just aborts the app loop; cleanup is handled by the guard.
+    ctrlc::set_handler(|| {
+        std::process::exit(130);
+    })
+    .expect("failed to set Ctrl-C handler");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_app(&mut terminal, registry, sources)
+    }));
+
+    match result {
+        Ok(Err(e)) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
         }
-    }).expect("failed to set Ctrl-C handler");
-
-    let result = run_app(&mut terminal, registry, sources);
-
-    // Mark as stopped so a pending SIGINT doesn't double-restore
-    running.store(false, std::sync::atomic::Ordering::Relaxed);
-
-    // Restore terminal
-    disable_raw_mode().expect("failed to disable raw mode");
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).expect("failed to leave alt screen");
-    terminal.show_cursor().expect("failed to show cursor");
-
-    if let Err(e) = result {
-        eprintln!("Error: {e}");
-        std::process::exit(1);
+        Err(_panic) => {
+            eprintln!("Panic occurred");
+            std::process::exit(101);
+        }
+        Ok(Ok(())) => {}
     }
 }
 
@@ -101,10 +116,18 @@ struct DocStyleSheet;
 impl StyleSheet for DocStyleSheet {
     fn heading(&self, level: u8) -> Style {
         match level {
-            1 => Style::default().fg(Color::Rgb(130, 200, 255)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            2 => Style::default().fg(Color::Rgb(100, 220, 180)).add_modifier(Modifier::BOLD),
-            3 => Style::default().fg(Color::Rgb(255, 180, 100)).add_modifier(Modifier::BOLD),
-            _ => Style::default().fg(Color::Rgb(200, 210, 220)).add_modifier(Modifier::BOLD),
+            1 => Style::default()
+                .fg(Color::Rgb(130, 200, 255))
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            2 => Style::default()
+                .fg(Color::Rgb(100, 220, 180))
+                .add_modifier(Modifier::BOLD),
+            3 => Style::default()
+                .fg(Color::Rgb(255, 180, 100))
+                .add_modifier(Modifier::BOLD),
+            _ => Style::default()
+                .fg(Color::Rgb(200, 210, 220))
+                .add_modifier(Modifier::BOLD),
         }
     }
     fn code(&self) -> Style {
@@ -124,14 +147,14 @@ impl StyleSheet for DocStyleSheet {
     }
 }
 
-/// Background color used for code block content to make it visually distinct.
-const CODE_BG: Color = Color::Rgb(38, 42, 50);
+/// Foreground color used for code block content to make it visually distinct.
+const CODE_FG: Color = Color::Rgb(180, 200, 160);
 
 /// Post-process Text produced by tui-markdown:
 /// - Bake Line.base style into spans (ratatui Paragraph ignores Line.style)
 /// - Strip "# " heading prefixes (color + modifiers convey level)
 /// - Remove ```lang / ``` fence marker lines
-/// - Apply CODE_BG to code block content spans
+/// - Apply CODE_FG foreground and two-space indent to code block lines
 fn process_markdown(mut text: Text<'_>) -> Text<'_> {
     let mut in_code_block = false;
 
@@ -174,17 +197,24 @@ fn process_markdown(mut text: Text<'_>) -> Text<'_> {
         // Strip leading "#" prefix (one or more hashes + space) from heading lines.
         if line.style.fg.is_some() && line.style.add_modifier.contains(Modifier::BOLD) {
             if let Some(first_span) = line.spans.first_mut() {
-                *first_span.content.to_mut() = first_span.content.as_ref()
+                *first_span.content.to_mut() = first_span
+                    .content
+                    .as_ref()
                     .trim_start_matches('#')
                     .trim_start_matches(' ')
                     .to_string();
             }
         }
 
-        // Apply code background to content inside fenced blocks.
+        // Apply code styling: two-space indent + distinct foreground.
         if code_lines[i] {
+            // Prepend two spaces to the first span.
+            if let Some(first_span) = line.spans.first_mut() {
+                *first_span.content.to_mut() = format!("  {}", first_span.content.as_ref());
+            }
+            // Override fg on every span with CODE_FG.
             for span in &mut line.spans {
-                span.style.bg = Some(CODE_BG);
+                span.style.fg = Some(CODE_FG);
             }
         }
 
@@ -209,15 +239,14 @@ fn run_app(
     sources: Vec<DocSource>,
 ) -> io::Result<()> {
     // Spawn dedicated search thread with (path, kind) tuples
-    let all_items: Vec<(String, String)> = registry.all_items()
+    let all_items: Vec<(String, String)> = registry
+        .all_items()
         .iter()
         .map(|item| (item.path.clone(), item.kind.clone()))
         .collect();
     let (tx_req, rx_req) = mpsc::channel::<SearchRequest>();
     let (tx_rep, rx_rep) = mpsc::channel::<SearchReply>();
-    thread::spawn(move || {
-        search_worker(all_items, rx_req, tx_rep)
-    });
+    thread::spawn(move || search_worker(all_items, rx_req, tx_rep));
 
     let mut app = App {
         mode: AppMode::Search,
@@ -256,11 +285,15 @@ fn run_app(
                                     submit_search(&mut app);
                                 }
                                 'w' => {
-                                    let trimmed = app.query.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_');
+                                    let trimmed = app.query.trim_end_matches(|c: char| {
+                                        c.is_alphanumeric() || c == '_'
+                                    });
                                     app.query.truncate(trimmed.len());
                                     submit_search(&mut app);
                                 }
-                                _ => {}
+                                _ => { 
+                                    handle_search_key(&mut app, key);
+                                },
                             }
                         } else {
                             app.query.push(c);
@@ -287,17 +320,18 @@ fn search_worker(
 ) {
     while let Ok(SearchRequest { id, query }) = rx_req.recv() {
         // Check for leading kind badge
-        let (kind_filter, rest_query): (Option<Vec<String>>, String) = if let Some(space_pos) = query.find(' ') {
-            let badge = &query[..space_pos];
-            let kinds = kind_badge_to_kinds(badge);
-            if !kinds.is_empty() {
-                (Some(kinds), query[space_pos + 1..].to_string())
+        let (kind_filter, rest_query): (Option<Vec<String>>, String) =
+            if let Some(space_pos) = query.find(' ') {
+                let badge = &query[..space_pos];
+                let kinds = kind_badge_to_kinds(badge);
+                if !kinds.is_empty() {
+                    (Some(kinds), query[space_pos + 1..].to_string())
+                } else {
+                    (None, query.clone())
+                }
             } else {
                 (None, query.clone())
-            }
-        } else {
-            (None, query.clone())
-        };
+            };
         let words: Vec<&str> = rest_query.split_whitespace().collect();
         let case_sensitive = has_uppercase(&rest_query);
         let indices = if words.is_empty() {
@@ -314,7 +348,10 @@ fn search_worker(
                     matches.push((i, score));
                 }
             }
-            matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| all_items[a.0].0.cmp(&all_items[b.0].0)));
+            matches.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| all_items[a.0].0.cmp(&all_items[b.0].0))
+            });
             matches.into_iter().map(|(i, _)| i).collect()
         };
         let _ = tx_rep.send(SearchReply { id, indices });
@@ -344,8 +381,13 @@ fn drain_results(app: &mut App) {
     for reply in pending {
         if reply.id == app.search_id {
             app.items = reply.indices;
-            if app.list_state.selected().is_some_and(|s| s >= app.items.len()) {
-                app.list_state.select(if app.items.is_empty() { None } else { Some(0) });
+            if app
+                .list_state
+                .selected()
+                .is_some_and(|s| s >= app.items.len())
+            {
+                app.list_state
+                    .select(if app.items.is_empty() { None } else { Some(0) });
             }
             if let Some(selected) = app.list_state.selected() {
                 prefetch_around(app, selected);
@@ -357,6 +399,17 @@ fn drain_results(app: &mut App) {
 /// Handle a key press in search mode. Returns true if the app should quit.
 fn handle_search_key(app: &mut App, key: event::KeyEvent) -> bool {
     match key.code {
+        _ if key.modifiers.contains(KeyModifiers::CONTROL) => match key.code {
+            KeyCode::Char('f') => navigate_list(app, 15),
+            KeyCode::Char('b') => navigate_list(app, -15),
+            KeyCode::Char('n') => navigate_list(app, 1),
+            KeyCode::Char('p') => {
+                if app.list_state.selected().is_some() {
+                    navigate_list(app, -1);
+                }
+            }
+            _ => {}
+        },
         KeyCode::Esc => {
             if app.query.is_empty() {
                 return true;
@@ -397,7 +450,8 @@ fn handle_search_key(app: &mut App, key: event::KeyEvent) -> bool {
             submit_search(app);
         }
         KeyCode::Delete => {
-            let end = app.query
+            let end = app
+                .query
                 .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_')
                 .len();
             app.query.truncate(end);
@@ -452,9 +506,7 @@ fn navigate_list(app: &mut App, delta: i32) {
         return;
     }
     let new = match app.list_state.selected() {
-        Some(current) => {
-            ((current as i32 + delta).clamp(0, (app.items.len() - 1) as i32)) as usize
-        }
+        Some(current) => ((current as i32 + delta).clamp(0, (app.items.len() - 1) as i32)) as usize,
         None => {
             // No item selected yet: Down picks first, Up picks last
             if delta > 0 { 0 } else { app.items.len() - 1 }
@@ -492,22 +544,25 @@ fn render(f: &mut Frame, app: &mut App) {
 
 fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
     let chunks = Layout::vertical([
-        Constraint::Length(3),  // Search bar
-        Constraint::Length(1),  // Status
-        Constraint::Min(5),     // Item list
-        Constraint::Length(1),  // Footer
+        Constraint::Length(3), // Search bar
+        Constraint::Length(1), // Status
+        Constraint::Min(5),    // Item list
+        Constraint::Length(1), // Footer
     ])
     .split(size);
 
+    // Clear each region independently to avoid artifacts from previous frame layouts.
+    for chunk in chunks.as_ref() {
+        f.render_widget(Clear, *chunk);
+    }
+
     // Search bar with blinking cursor block
     let cursor_char = "█";
-    let search_text = Text::from(vec![
-        Line::from(vec![
-            Span::styled(" / ", Style::default().fg(Color::Rgb(180, 80, 80))),
-            Span::raw(&app.query),
-            Span::styled(cursor_char, Style::default().fg(Color::Rgb(180, 80, 80))),
-        ]),
-    ]);
+    let search_text = Text::from(vec![Line::from(vec![
+        Span::styled(" / ", Style::default().fg(Color::Rgb(180, 80, 80))),
+        Span::raw(&app.query),
+        Span::styled(cursor_char, Style::default().fg(Color::Rgb(180, 80, 80))),
+    ])]);
     let search = Paragraph::new(search_text)
         .block(
             Block::default()
@@ -521,14 +576,12 @@ fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
     // Status line
     let item_count = app.items.len();
     let total = app.registry.all_items().len();
-    let status = Paragraph::new(Line::from(vec![
-        Span::raw(format!(
-            " {} items (from {} total) - {} sources",
-            item_count,
-            total,
-            app.sources.len(),
-        )),
-    ]))
+    let status = Paragraph::new(Line::from(vec![Span::raw(format!(
+        " {} items (from {} total) - {} sources",
+        item_count,
+        total,
+        app.sources.len(),
+    ))]))
     .style(Style::default().fg(Color::Rgb(120, 140, 160)));
     f.render_widget(status, chunks[1]);
 
@@ -544,13 +597,30 @@ fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
 
             let line = if selected {
                 Line::from(vec![
-                    Span::styled(format!(" {} ", kind_str), Style::default().fg(Color::Rgb(30, 30, 30)).bg(kind_color).bold()),
-                    Span::styled(format!(" {}", item.path), Style::default().fg(Color::Rgb(30, 30, 30)).bg(Color::Rgb(180, 210, 240))),
+                    Span::styled(
+                        format!(" {} ", kind_str),
+                        Style::default()
+                            .fg(Color::Rgb(30, 30, 30))
+                            .bg(kind_color)
+                            .bold(),
+                    ),
+                    Span::styled(
+                        format!(" {}", item.path),
+                        Style::default()
+                            .fg(Color::Rgb(30, 30, 30))
+                            .bg(Color::Rgb(180, 210, 240)),
+                    ),
                 ])
             } else {
                 Line::from(vec![
-                    Span::styled(format!(" {} ", kind_str), Style::default().fg(kind_color).bold()),
-                    Span::styled(format!(" {}", item.path), Style::default().fg(Color::Rgb(200, 210, 220))),
+                    Span::styled(
+                        format!(" {} ", kind_str),
+                        Style::default().fg(kind_color).bold(),
+                    ),
+                    Span::styled(
+                        format!(" {}", item.path),
+                        Style::default().fg(Color::Rgb(200, 210, 220)),
+                    ),
                 ])
             };
 
@@ -575,18 +645,30 @@ fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
                 .style(Style::default().fg(Color::Rgb(80, 100, 120)))
                 .begin_symbol(Some("\u{25b2}"))
                 .end_symbol(Some("\u{25bc}")),
-            chunks[2].inner(Margin { vertical: 0, horizontal: 1 }),
+            chunks[2].inner(Margin {
+                vertical: 0,
+                horizontal: 1,
+            }),
             &mut scrollbar_state,
         );
     }
 
     // Footer with key hints
     let footer = Paragraph::new(Line::from(vec![
-        Span::styled(" enter ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        Span::styled(
+            " enter ",
+            Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
+        ),
         Span::raw("detail  "),
-        Span::styled(" esc ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        Span::styled(
+            " esc ",
+            Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
+        ),
         Span::raw("quit/clear  "),
-        Span::styled(" C-u ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        Span::styled(
+            " C-u ",
+            Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
+        ),
         Span::raw("clear"),
     ]))
     .style(Style::default().fg(Color::Rgb(80, 100, 120)));
@@ -595,11 +677,16 @@ fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
 
 fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
     let chunks = Layout::vertical([
-        Constraint::Length(3),  // Title bar
-        Constraint::Min(5),     // Content
-        Constraint::Length(1),  // Footer
+        Constraint::Length(3), // Title bar
+        Constraint::Min(5),    // Content
+        Constraint::Length(1), // Footer
     ])
     .split(size);
+
+    // Clear each region independently to avoid artifacts from previous frame layouts.
+    for chunk in chunks.as_ref() {
+        f.render_widget(Clear, *chunk);
+    }
 
     // Title bar
     let title = if let Some(selected) = app.list_state.selected() {
@@ -636,7 +723,7 @@ fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(60, 70, 80)))
+                .border_style(Style::default().fg(Color::Rgb(60, 70, 80))),
         )
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
@@ -644,11 +731,20 @@ fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
 
     // Footer with key hints
     let footer = Paragraph::new(Line::from(vec![
-        Span::styled(" esc/q ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        Span::styled(
+            " esc/q ",
+            Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
+        ),
         Span::raw("back  "),
-        Span::styled(" j/k/↑/↓ ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        Span::styled(
+            " j/k/↑/↓ ",
+            Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
+        ),
         Span::raw("scroll  "),
-        Span::styled(" space/backspace ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
+        Span::styled(
+            " space/backspace ",
+            Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
+        ),
         Span::raw("page"),
     ]))
     .style(Style::default().fg(Color::Rgb(80, 100, 120)));
@@ -662,18 +758,20 @@ fn render_help(f: &mut Frame, size: Rect) {
             Style::default().fg(Color::Rgb(200, 220, 240)).bold(),
         )),
         Line::raw(""),
-        Line::from(vec![
-            Span::styled(" 1. Generate docs for your crate:", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
-        ]),
+        Line::from(vec![Span::styled(
+            " 1. Generate docs for your crate:",
+            Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
+        )]),
         Line::raw(""),
         Line::from(Span::styled(
             "    cargo doc --no-deps        # generates target/doc/your_crate/",
             Style::default().fg(Color::Rgb(200, 210, 220)),
         )),
         Line::raw(""),
-        Line::from(vec![
-            Span::styled(" 2. Point clidoc at the HTML output:", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
-        ]),
+        Line::from(vec![Span::styled(
+            " 2. Point clidoc at the HTML output:",
+            Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
+        )]),
         Line::raw(""),
         Line::from(Span::styled(
             "    clidoc ./target/doc          # multi-crate root with all.html",
@@ -688,9 +786,10 @@ fn render_help(f: &mut Frame, size: Rect) {
             Style::default().fg(Color::Rgb(200, 210, 220)),
         )),
         Line::raw(""),
-        Line::from(vec![
-            Span::styled(" Requirements:", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
-        ]),
+        Line::from(vec![Span::styled(
+            " Requirements:",
+            Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
+        )]),
         Line::raw(""),
         Line::from(Span::styled(
             "    The directory must contain 'all.html' or 'sidebar-items*.js'",
@@ -707,13 +806,12 @@ fn render_help(f: &mut Frame, size: Rect) {
         ),
     ];
 
-    let help = Paragraph::new(help_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(80, 120, 160)))
-                .title(" How to add docs "),
-        );
+    let help = Paragraph::new(help_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Rgb(80, 120, 160)))
+            .title(" How to add docs "),
+    );
 
     // Center the help box
     let popup_width = 56.min(size.width.saturating_sub(4));
@@ -746,7 +844,7 @@ fn kind_display(kind: &str) -> (Color, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tui_markdown::{from_str_with_options, Options};
+    use tui_markdown::{Options, from_str_with_options};
 
     /// Render markdown through our full pipeline (DocStyleSheet + post-processing).
     fn render(md: &str) -> Text<'_> {
@@ -759,13 +857,27 @@ mod tests {
     /// Describe a single Style as tokens like `fg=Rgb(130,200,255) bold underlined`, or `-` for default.
     fn describe_style(style: &Style) -> String {
         let mut parts = Vec::new();
-        match style.fg { Some(c) => parts.push(format!("fg={:?}", c)), None => {} }
-        match style.bg { Some(c) => parts.push(format!("bg={:?}", c)), None => {} }
+        match style.fg {
+            Some(c) => parts.push(format!("fg={:?}", c)),
+            None => {}
+        }
+        match style.bg {
+            Some(c) => parts.push(format!("bg={:?}", c)),
+            None => {}
+        }
         let mods = style.add_modifier;
-        if mods.contains(Modifier::BOLD) { parts.push("bold".into()); }
-        if mods.contains(Modifier::ITALIC) { parts.push("italic".into()); }
-        if mods.contains(Modifier::UNDERLINED) { parts.push("underlined".into()); }
-        if mods.contains(Modifier::DIM) { parts.push("dim".into()); }
+        if mods.contains(Modifier::BOLD) {
+            parts.push("bold".into());
+        }
+        if mods.contains(Modifier::ITALIC) {
+            parts.push("italic".into());
+        }
+        if mods.contains(Modifier::UNDERLINED) {
+            parts.push("underlined".into());
+        }
+        if mods.contains(Modifier::DIM) {
+            parts.push("dim".into());
+        }
         if parts.is_empty() {
             "-".to_string()
         } else {
@@ -778,12 +890,21 @@ mod tests {
     /// The `base=` column shows the ratatui Line's patched base style (where heading colors land).
     /// Span styles are shown per-span; `-` means that span has no extra styling beyond the base.
     fn format_text(text: &Text) -> String {
-        text.lines.iter().enumerate().map(|(i, line)| {
-            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            let base = describe_style(&line.style);
-            let spans: Vec<String> = line.spans.iter().map(|s| describe_style(&s.style)).collect();
-            format!("{:04}: {:?} |{}| {}", i, content, base, spans.join(" "))
-        }).collect::<Vec<_>>().join("\n")
+        text.lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                let base = describe_style(&line.style);
+                let spans: Vec<String> = line
+                    .spans
+                    .iter()
+                    .map(|s| describe_style(&s.style))
+                    .collect();
+                format!("{:04}: {:?} |{}| {}", i, content, base, spans.join(" "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Full rustdoc-like page: heading hierarchy, paragraphs, lists, code blocks, inline code.
@@ -802,11 +923,19 @@ mod tests {
         let line = &text.lines[0];
         // Content should no longer have the "# " prefix.
         let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(content, "Main Title", "heading prefix not stripped: {:?}", content);
+        assert_eq!(
+            content, "Main Title",
+            "heading prefix not stripped: {:?}",
+            content
+        );
         // First non-empty span carries the H1 color.
         let span = line.spans.first().expect("empty line");
         assert_eq!(span.style.fg, Some(Color::Rgb(130, 200, 255)));
-        assert!(span.style.add_modifier.contains(Modifier::BOLD | Modifier::UNDERLINED));
+        assert!(
+            span.style
+                .add_modifier
+                .contains(Modifier::BOLD | Modifier::UNDERLINED)
+        );
     }
 
     #[test]
@@ -849,27 +978,46 @@ fn main() {
         let lines_str: Vec<String> = text.lines.iter().map(|l| l.to_string()).collect();
 
         // Fence markers should be stripped.
-        assert!(!lines_str.iter().any(|l| l.starts_with("```")),
-            "fence markers should be removed: {:?}", lines_str);
+        assert!(
+            !lines_str.iter().any(|l| l.starts_with("```")),
+            "fence markers should be removed: {:?}",
+            lines_str
+        );
 
-        // Indentation preserved.
-        let println_line = lines_str.iter()
+        // Two-space indent added + original indentation preserved.
+        let println_line = lines_str
+            .iter()
             .find(|l| l.contains("println"))
             .unwrap_or_else(|| panic!("no println line in {:?}", lines_str));
-        assert!(println_line.starts_with("    "), "4-space indent lost: {:?}", println_line);
+        assert!(
+            println_line.starts_with("      "),
+            "2+4 space indent expected: {:?}",
+            println_line
+        );
 
-        let nested_line = lines_str.iter()
+        let nested_line = lines_str
+            .iter()
             .find(|l| l.contains("deeply_nested"))
             .unwrap_or_else(|| panic!("no deeply_nested line in {:?}", lines_str));
-        assert!(nested_line.starts_with("        "), "8-space indent lost: {:?}", nested_line);
+        assert!(
+            nested_line.starts_with("          "),
+            "2+8 space indent expected: {:?}",
+            nested_line
+        );
 
-        // Code content spans carry CODE_BG background.
+        // Code content spans carry CODE_FG foreground.
         for line in &text.lines {
             let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            if content.trim().is_empty() { continue; }
+            if content.trim().is_empty() {
+                continue;
+            }
             for span in &line.spans {
-                assert_eq!(span.style.bg, Some(CODE_BG),
-                    "code content should have CODE_BG bg on {:?}", content);
+                assert_eq!(
+                    span.style.fg,
+                    Some(CODE_FG),
+                    "code content should have CODE_FG fg on {:?}",
+                    content
+                );
             }
         }
     }
