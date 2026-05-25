@@ -124,10 +124,82 @@ impl StyleSheet for DocStyleSheet {
     }
 }
 
+/// Background color used for code block content to make it visually distinct.
+const CODE_BG: Color = Color::Rgb(38, 42, 50);
+
+/// Post-process Text produced by tui-markdown:
+/// - Bake Line.base style into spans (ratatui Paragraph ignores Line.style)
+/// - Strip "# " heading prefixes (color + modifiers convey level)
+/// - Remove ```lang / ``` fence marker lines
+/// - Apply CODE_BG to code block content spans
+fn process_markdown(mut text: Text<'_>) -> Text<'_> {
+    let mut in_code_block = false;
+
+    // First pass: mark which lines are inside code blocks (between fence markers).
+    let mut code_lines = vec![false; text.lines.len()];
+    for (i, line) in text.lines.iter().enumerate() {
+        let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let trimmed = content.trim();
+        if trimmed.starts_with("```") && !in_code_block {
+            in_code_block = true;
+            continue;
+        }
+        if trimmed == "```" && in_code_block {
+            in_code_block = false;
+            continue;
+        }
+        if in_code_block {
+            code_lines[i] = true;
+        }
+    }
+
+    // Second pass: apply fixes per line.
+    let mut filtered = Vec::with_capacity(text.lines.len());
+    for (i, line) in text.lines.iter_mut().enumerate() {
+        // Skip fence marker lines entirely.
+        let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let trimmed = content.trim();
+        if trimmed.starts_with("```") {
+            continue;
+        }
+
+        // Bake base style into spans so ratatui actually paints them.
+        let base = line.style;
+        if base != Style::default() {
+            for span in &mut line.spans {
+                span.style = base.patch(span.style);
+            }
+        }
+
+        // Strip leading "#" prefix (one or more hashes + space) from heading lines.
+        if line.style.fg.is_some() && line.style.add_modifier.contains(Modifier::BOLD) {
+            if let Some(first_span) = line.spans.first_mut() {
+                *first_span.content.to_mut() = first_span.content.as_ref()
+                    .trim_start_matches('#')
+                    .trim_start_matches(' ')
+                    .to_string();
+            }
+        }
+
+        // Apply code background to content inside fenced blocks.
+        if code_lines[i] {
+            for span in &mut line.spans {
+                span.style.bg = Some(CODE_BG);
+            }
+        }
+
+        filtered.push(std::mem::take(line));
+    }
+
+    text.lines = filtered;
+    text
+}
+
 impl App {
     fn detail_text(&self) -> Text<'_> {
         let options = Options::new(DocStyleSheet);
-        from_str_with_options(&self.detail_md, &options)
+        let raw = from_str_with_options(&self.detail_md, &options);
+        process_markdown(raw)
     }
 }
 
@@ -175,10 +247,6 @@ fn run_app(
             }
             match app.mode {
                 AppMode::Search => {
-                    if key.code == KeyCode::Char('?') {
-                        app.mode = AppMode::Help;
-                        continue;
-                    }
                     if let KeyCode::Char(c) = key.code {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
                             match c {
@@ -358,8 +426,11 @@ fn handle_detail_key(app: &mut App, key: event::KeyEvent) {
             app.detail_scroll = app.detail_scroll.saturating_add(15);
         }
         _ if key.modifiers.contains(KeyModifiers::CONTROL) => match key.code {
-            KeyCode::Char('f') | KeyCode::Char('b') => {
+            KeyCode::Char('f') => {
                 app.detail_scroll = app.detail_scroll.saturating_add(15);
+            }
+            KeyCode::Char('b') => {
+                app.detail_scroll = app.detail_scroll.saturating_sub(15);
             }
             KeyCode::Char('u') => {
                 app.detail_scroll = app.detail_scroll.saturating_sub(15);
@@ -568,7 +639,7 @@ fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
                 .border_style(Style::default().fg(Color::Rgb(60, 70, 80)))
         )
         .scroll((scroll, 0))
-        .wrap(Wrap { trim: true });
+        .wrap(Wrap { trim: false });
     f.render_widget(content, chunks[1]);
 
     // Footer with key hints
@@ -677,10 +748,11 @@ mod tests {
     use super::*;
     use tui_markdown::{from_str_with_options, Options};
 
-    /// Render markdown through our DocStyleSheet and return the resulting Text.
+    /// Render markdown through our full pipeline (DocStyleSheet + post-processing).
     fn render(md: &str) -> Text<'_> {
         let options = Options::new(DocStyleSheet);
-        from_str_with_options(md, &options)
+        let raw = from_str_with_options(md, &options);
+        super::process_markdown(raw)
     }
 
     /// Format each line as `"<content> [styles...]"` for readable assertion output.
@@ -723,39 +795,45 @@ mod tests {
         insta::assert_snapshot!("full_rustdoc_page", formatted);
     }
 
+    /// After post-processing, heading colors live on Span.style (baked from Line.base).
     #[test]
     fn h1_is_bright_blue_bold_underlined() {
         let text = render("# Main Title");
         let line = &text.lines[0];
-        // The heading prefix "# " and body share the same patched style.
-        let base_fg = line.style.fg;
-        assert_eq!(base_fg, Some(Color::Rgb(130, 200, 255)),
-            "H1 should be bright blue Rgb(130,200,255), got {:?}", base_fg);
-        assert!(line.style.add_modifier.contains(Modifier::BOLD), "H1 should be bold");
-        assert!(line.style.add_modifier.contains(Modifier::UNDERLINED), "H1 should be underlined");
+        // Content should no longer have the "# " prefix.
+        let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(content, "Main Title", "heading prefix not stripped: {:?}", content);
+        // First non-empty span carries the H1 color.
+        let span = line.spans.first().expect("empty line");
+        assert_eq!(span.style.fg, Some(Color::Rgb(130, 200, 255)));
+        assert!(span.style.add_modifier.contains(Modifier::BOLD | Modifier::UNDERLINED));
     }
 
     #[test]
     fn h2_is_teal_bold() {
         let text = render("## Subtitle");
         let line = &text.lines[0];
-        assert_eq!(line.style.fg, Some(Color::Rgb(100, 220, 180)),
-            "H2 should be teal Rgb(100,220,180), got {:?}", line.style.fg);
-        assert!(line.style.add_modifier.contains(Modifier::BOLD), "H2 should be bold");
-        assert!(!line.style.add_modifier.contains(Modifier::UNDERLINED), "H2 should NOT be underlined");
+        let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(content, "Subtitle");
+        let span = line.spans.first().expect("empty line");
+        assert_eq!(span.style.fg, Some(Color::Rgb(100, 220, 180)));
+        assert!(span.style.add_modifier.contains(Modifier::BOLD));
+        assert!(!span.style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]
     fn h3_is_orange_bold() {
         let text = render("### Section");
         let line = &text.lines[0];
-        assert_eq!(line.style.fg, Some(Color::Rgb(255, 180, 100)),
-            "H3 should be orange Rgb(255,180,100), got {:?}", line.style.fg);
-        assert!(line.style.add_modifier.contains(Modifier::BOLD), "H3 should be bold");
+        let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(content, "Section");
+        let span = line.spans.first().expect("empty line");
+        assert_eq!(span.style.fg, Some(Color::Rgb(255, 180, 100)));
+        assert!(span.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
-    fn code_fence_and_indentation_snapshot() {
+    fn code_block_styled_indented_no_fences() {
         let md = r#"
 ```rust
 fn main() {
@@ -768,11 +846,13 @@ fn main() {
         let formatted = format_text(&text);
         insta::assert_snapshot!("code_fence_indentation", formatted);
 
-        // Also do structural assertions
         let lines_str: Vec<String> = text.lines.iter().map(|l| l.to_string()).collect();
-        assert!(lines_str.iter().any(|l| l == "```rust"), "missing opening fence");
-        assert!(lines_str.iter().any(|l| l == "```"), "missing closing fence");
 
+        // Fence markers should be stripped.
+        assert!(!lines_str.iter().any(|l| l.starts_with("```")),
+            "fence markers should be removed: {:?}", lines_str);
+
+        // Indentation preserved.
         let println_line = lines_str.iter()
             .find(|l| l.contains("println"))
             .unwrap_or_else(|| panic!("no println line in {:?}", lines_str));
@@ -782,5 +862,15 @@ fn main() {
             .find(|l| l.contains("deeply_nested"))
             .unwrap_or_else(|| panic!("no deeply_nested line in {:?}", lines_str));
         assert!(nested_line.starts_with("        "), "8-space indent lost: {:?}", nested_line);
+
+        // Code content spans carry CODE_BG background.
+        for line in &text.lines {
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            if content.trim().is_empty() { continue; }
+            for span in &line.spans {
+                assert_eq!(span.style.bg, Some(CODE_BG),
+                    "code content should have CODE_BG bg on {:?}", content);
+            }
+        }
     }
 }
