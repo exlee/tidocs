@@ -10,7 +10,7 @@ keywords = ["cli", "rust-docs", "terminal", "documentation", "tui"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 exclude = [
-    "/cue",
+    "/.github",
     "/tests",
     "/src/snapshots",
 ]
