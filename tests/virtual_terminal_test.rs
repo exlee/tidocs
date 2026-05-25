@@ -1,4 +1,4 @@
-//! Integration tests that drive the real `clidoc` binary through a virtual terminal.
+//! Integration tests that drive the real `tidocs` binary through a virtual terminal.
 //!
 //! Uses `portable-pty` to allocate a pseudo-terminal, writes keystrokes to it,
 //! and reads back the rendered ANSI output after each interaction step.
@@ -9,9 +9,9 @@ use std::io::{Read, Write};
 use std::sync::{OnceLock, mpsc};
 use std::time::Duration;
 
-/// Return the path to the compiled `clidoc` binary.
-fn clidoc_bin() -> std::path::PathBuf {
-    assert_cmd::Command::cargo_bin("clidoc")
+/// Return the path to the compiled `tidocs` binary.
+fn tidocs_bin() -> std::path::PathBuf {
+    assert_cmd::Command::cargo_bin("tidocs")
         .unwrap()
         .get_program()
         .into()
@@ -107,13 +107,13 @@ fn search_span_add_shows_fn_add() {
         })
         .expect("failed to open pty");
 
-    // Spawn clidoc connected to the slave side of the PTY.
-    let mut cmd_builder = CommandBuilder::new(clidoc_bin());
+    // Spawn tidocs connected to the slave side of the PTY.
+    let mut cmd_builder = CommandBuilder::new(tidocs_bin());
     cmd_builder.arg("./target/doc");
     let child = pair
         .slave
         .spawn_command(cmd_builder)
-        .expect("failed to spawn clidoc");
+        .expect("failed to spawn tidocs");
 
     // Start collecting output from the master side.
     let reader = pair

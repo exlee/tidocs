@@ -786,7 +786,7 @@ fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Rgb(100, 120, 140)))
-                .title(" clidoc "),
+                .title(" tidocs "),
         )
         .style(Style::default().fg(Color::White));
     f.render_widget(search, chunks[0]);
@@ -908,7 +908,7 @@ fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
         ),
         Span::raw("clear"),
     ]);
-    let tip = Line::raw("cargo doc -p <PKG> && clidoc target/doc");
+    let tip = Line::raw("cargo doc -p <PKG> && tidocs target/doc");
     let footer = Paragraph::new(keys).style(Style::default().fg(Color::Rgb(80, 100, 120)));
     let tip_para = Paragraph::new(tip)
         .style(Style::default().fg(Color::Rgb(80, 100, 120)))
@@ -1054,20 +1054,20 @@ fn render_help(f: &mut Frame, size: Rect) {
         )),
         Line::raw(""),
         Line::from(vec![Span::styled(
-            " 2. Point clidoc at the HTML output:",
+            " 2. Point tidocs at the HTML output:",
             Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
         )]),
         Line::raw(""),
         Line::from(Span::styled(
-            "    clidoc ./target/doc          # multi-crate root with all.html",
+            "    tidocs ./target/doc          # multi-crate root with all.html",
             Style::default().fg(Color::Rgb(200, 210, 220)),
         )),
         Line::from(Span::styled(
-            "    clidoc ./target/doc/your_crate   # single crate dir",
+            "    tidocs ./target/doc/your_crate   # single crate dir",
             Style::default().fg(Color::Rgb(200, 210, 220)),
         )),
         Line::from(Span::styled(
-            "    clidoc                         # default: rustup std docs",
+            "    tidocs                         # default: rustup std docs",
             Style::default().fg(Color::Rgb(200, 210, 220)),
         )),
         Line::raw(""),

@@ -1,0 +1,32 @@
+---
+source: src/ui.rs
+assertion_line: 1201
+expression: formatted
+---
+0000: "Peek(struct)" |fg=Rgb(130, 200, 255) bold underlined| fg=Rgb(130, 200, 255) bold underlined fg=Rgb(130, 200, 255) bold underlined fg=Rgb(130, 200, 255) bold underlined
+0001: "" |-| 
+0002: " Peek at the next item in an iterator without consuming it." |-| -
+0003: "" |-| 
+0004: "Implementations" |fg=Rgb(255, 180, 100) bold| fg=Rgb(255, 180, 100) bold fg=Rgb(255, 180, 100) bold
+0005: "" |-| 
+0006: "impl<T, I> Peek<T, I>" |fg=Rgb(200, 210, 220) bold| fg=Rgb(200, 210, 220) bold fg=Rgb(210, 200, 160) bold
+0007: "" |-| 
+0008: " Methods on  Peek  that take  self ." |-| - fg=Rgb(210, 200, 160) - fg=Rgb(210, 200, 160) -
+0009: "" |-| 
+0010: "pub fn peek(&mut self) -> Option<&T>" |fg=Rgb(200, 210, 220) bold| fg=Rgb(200, 210, 220) bold fg=Rgb(210, 200, 160) bold
+0011: "" |-| 
+0012: " Looks at the second element of an iterator  without advancing it ." |-| - bold -
+0013: "" |-| 
+0014: "   let   mut  iter  =   vec! [ 1 ,   2 ,   3 ] . into_iter ( ) . peekable ( ) ;" |-| fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160)
+0015: "   assert_eq! ( iter. peek ( ) ,   Some ( & 1 ) ) ;" |-| fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160) fg=Rgb(180, 200, 160)
+0016: "" |-| 
+0017: "pub fn peek_mut(&mut self) -> Option<&mut T>" |fg=Rgb(200, 210, 220) bold| fg=Rgb(200, 210, 220) bold fg=Rgb(210, 200, 160) bold
+0018: "" |-| 
+0019: " Like  [ peek ]  but returns a mutable reference." |-| - - - - -
+0020: "" |-| 
+0021: " -  Returns  None  when the iterator is exhausted" |-| - - fg=Rgb(210, 200, 160) -
+0022: " -  Does not consume the element" |-| - -
+0023: "" |-| 
+0024: "fn example()" |fg=Rgb(200, 210, 220) bold| fg=Rgb(200, 210, 220) bold fg=Rgb(210, 200, 160) bold
+0025: "" |-| 
+0026: " This is a deeply nested heading." |-| -

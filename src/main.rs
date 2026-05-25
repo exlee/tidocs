@@ -2,10 +2,12 @@ mod docs;
 mod ui;
 
 use clap::Parser;
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "clidoc", about = "Browse Rust documentation in the terminal")]
+#[command(name = "tidocs", about = "Browse Rust documentation in the terminal")]
+
 struct Cli {
     /// Extra doc source paths (added on top of auto-discovered sources).
     /// Each can be a rustup doc root, cargo target/doc, or crate source dir.
@@ -22,6 +24,11 @@ struct Cli {
 }
 
 fn main() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
     let cli = Cli::parse();
 
     let (mut registry, mut sources) = docs::Registry::load(&cli.paths);
@@ -51,14 +58,16 @@ fn main() {
                         doc
                     };
 
-                    print!("{doc}");
+                    let _ = write!(std::io::stdout(), "{doc}");
                 } else {
                     eprintln!("No matching items found.");
                     std::process::exit(1);
                 }
             } else {
+                let out = std::io::stdout();
+                let mut handle = out.lock();
                 for item in &results {
-                    println!("{}", item.display_name());
+                    let _ = writeln!(handle, "{}", item.display_name());
                 }
                 if results.is_empty() {
                     std::process::exit(1);

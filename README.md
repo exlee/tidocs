@@ -1,4 +1,4 @@
-# clidoc
+# tidocs - Terminal Interface for Rust Docs
 
 Browse Rust documentation in your terminal. Search across all indexed crates
 with fuzzy matching, instant results, and full rendered doc pages.
@@ -16,7 +16,7 @@ with fuzzy matching, instant results, and full rendered doc pages.
 ## Installation
 
 ```bash
-cargo install clidoc
+cargo install tidocs
 ```
 
 ## Usage
@@ -25,23 +25,23 @@ cargo install clidoc
 
 ```bash
 # Browse rustup standard library docs (default)
-clidoc
+tidocs
 
 # Add custom crate docs
-clidoc ./my-project/target/doc
+tidocs ./my-project/target/doc
 
 # Multiple sources
-clidoc ./project-a/target/doc ./project-b/target/doc
+tidocs ./project-a/target/doc ./project-b/target/doc
 ```
 
 ### Non-interactive mode
 
 ```bash
 # List matches
-clidoc --query "Vec::push"
+tidocs --query "Vec::push"
 
 # Show full doc page for first match
-clidoc --query "Vec::push" --details
+tidocs --query "Vec::push" --details
 ```
 
 ### Kind-filtered search
@@ -104,18 +104,18 @@ tr Iterator  # only traits named "Iterator"
 
 ## Adding Documentation Sources
 
-Generate docs for your crate and point clidoc at the output:
+Generate docs for your crate and point tidocs at the output:
 
 ```bash
 cd my-crate
 cargo doc --no-deps
-clidoc target/doc
+tidocs target/doc
 ```
 
 Or use the multi-crate root directly:
 
 ```bash
-clidoc target/doc/my_crate
+tidocs target/doc/my_crate
 ```
 
 The directory must contain `all.html` or `sidebar-items*.js` files
@@ -124,7 +124,7 @@ The directory must contain `all.html` or `sidebar-items*.js` files
 ## Cache
 
 Indexed items and compressed HTML pages are stored in
-`$XDG_CACHE_HOME/clidoc/index.db` (or `~/.cache/clidoc/index.db`).
+`$XDG_CACHE_HOME/tidocs/index.db` (or `~/.cache/tidocs/index.db`).
 On subsequent runs, unchanged sources load instantly from the cache.
 
 ## License

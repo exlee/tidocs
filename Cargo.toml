@@ -1,10 +1,10 @@
 [package]
-name = "clidoc"
+name = "tidocs"
 version = "0.1.0"
 edition = "2024"
 authors = ["Przemysław Alexander Kamiński <xlii>"]
 description = "Browse Rust documentation in the terminal"
-repository = "https://github.com/xlii/clidoc"
+repository = "https://github.com/xlii/tidocs"
 license = "MIT"
 keywords = ["cli", "rust-docs", "terminal", "documentation", "tui"]
 categories = ["command-line-utilities", "development-tools"]
@@ -16,7 +16,7 @@ exclude = [
 ]
 
 [[bin]]
-name = "clidoc"
+name = "tidocs"
 path = "src/main.rs"
 
 [dependencies]
@@ -32,6 +32,7 @@ regex = "1.12.3"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 ctrlc = "3.5.2"
 flate2 = "1"
+libc = "0.2"
 
 [dev-dependencies]
 insta = { version = "1", features = ["yaml"] }

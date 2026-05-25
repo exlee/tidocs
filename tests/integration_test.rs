@@ -1,13 +1,13 @@
-//! Integration tests that drive the real `clidoc` binary via `assert_cmd`.
+//! Integration tests that drive the real `tidocs` binary via `assert_cmd`.
 //!
 //! Uses the non-interactive `--query` mode which searches and prints results
 //! to stdout without needing a TTY.
 
 use assert_cmd::Command;
 
-/// Return a `Command` pointing at the compiled `clidoc` binary.
-fn clidoc_cmd() -> Command {
-    Command::cargo_bin("clidoc").unwrap()
+/// Return a `Command` pointing at the compiled `tidocs` binary.
+fn tidocs_cmd() -> Command {
+    Command::cargo_bin("tidocs").unwrap()
 }
 
 /// Search for `ratatui::text::Span::add` and verify that "fn add" appears in the output.
@@ -16,7 +16,7 @@ fn clidoc_cmd() -> Command {
 /// is indexed in the local registry — the search returns no results.
 #[test]
 fn search_span_add_shows_fn_add() {
-    let mut cmd = clidoc_cmd();
+    let mut cmd = tidocs_cmd();
 
     // Use --query to search, --details to print full doc of first match.
     let output = cmd

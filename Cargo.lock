@@ -305,27 +305,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "clidoc"
-version = "0.1.0"
-dependencies = [
- "assert_cmd",
- "clap",
- "crossterm 0.28.1",
- "ctrlc",
- "dirs",
- "flate2",
- "html-to-markdown-rs",
- "insta",
- "portable-pty",
- "ratatui",
- "regex",
- "rusqlite",
- "serde_json",
- "tokio",
- "tui-markdown",
-]
-
-[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2392,6 +2371,28 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "tidocs"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "clap",
+ "crossterm 0.28.1",
+ "ctrlc",
+ "dirs",
+ "flate2",
+ "html-to-markdown-rs",
+ "insta",
+ "libc",
+ "portable-pty",
+ "ratatui",
+ "regex",
+ "rusqlite",
+ "serde_json",
+ "tokio",
+ "tui-markdown",
 ]
 
 [[package]]

@@ -12,7 +12,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BIN_NAME: clidoc
+  BIN_NAME: tidocs
   # Override local config (like mold) to use default linker in CI
   RUSTFLAGS: ""
 

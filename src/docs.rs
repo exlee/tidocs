@@ -156,7 +156,7 @@ impl Registry {
 
         all_items.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.kind.cmp(&b.kind)));
         all_items.dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
-        eprintln!("[clidoc] total: {} items", all_items.len());
+        eprintln!("[tidocs] total: {} items", all_items.len());
 
         let roots: Vec<PathBuf> = active_sources.iter().map(|s| s.path.clone()).collect();
         (Self::new(all_items, roots, source_map), active_sources)
@@ -367,7 +367,7 @@ impl Registry {
 fn db_path() -> PathBuf {
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("clidoc");
+        .join("tidocs");
     fs::create_dir_all(&cache_dir).ok();
     cache_dir.join("index.db")
 }
