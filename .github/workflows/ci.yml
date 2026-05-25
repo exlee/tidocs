@@ -1,4 +1,4 @@
-name: Build
+name: CI
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BIN_NAME: tmplr
+  BIN_NAME: clidoc
   # Override local config (like mold) to use default linker in CI
   RUSTFLAGS: ""
 
