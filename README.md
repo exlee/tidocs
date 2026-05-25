@@ -3,6 +3,9 @@
 Browse Rust documentation in your terminal. Search across all indexed crates
 with fuzzy matching, instant results, and full rendered doc pages.
 
+![](./assets/SCR-20260525-qisk.png)
+![](./assets/SCR-20260525-qivf.png)
+
 ## Features
 
 - **Auto-discovery** of rustup toolchain docs (std, core, alloc, etc.)
