@@ -102,6 +102,8 @@ struct App {
     list_state: ListState,
     detail_md: String,
     detail_scroll: u16,
+    /// Fragment anchor to scroll to on first render (e.g. "method.add").
+    detail_target: Option<String>,
     /// Send search requests to the worker.
     tx: mpsc::Sender<SearchRequest>,
     /// Receive search results from the worker.
@@ -233,6 +235,25 @@ impl App {
     }
 }
 
+/// Find the line index of a heading whose content matches `target_name`.
+/// Headings are identified by having a colored fg + bold modifier on the first span.
+fn find_heading_line(text: &[Line<'_>], target_name: &str) -> Option<usize> {
+    let lower_target = target_name.to_lowercase();
+    for (i, line) in text.iter().enumerate() {
+        let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        if let Some(first_span) = line.spans.first() {
+            if first_span.style.fg.is_some()
+                && first_span.style.add_modifier.contains(Modifier::BOLD)
+            {
+                if content.to_lowercase().contains(&lower_target) {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn run_app(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     registry: Registry,
@@ -257,6 +278,7 @@ fn run_app(
         list_state: ListState::default(),
         detail_md: String::new(),
         detail_scroll: 0,
+        detail_target: None,
         tx: tx_req,
         rx: rx_rep,
         search_id: 0,
@@ -424,6 +446,12 @@ fn handle_search_key(app: &mut App, key: event::KeyEvent) -> bool {
                 let item = &app.registry.all_items()[idx];
                 app.detail_md = app.registry.load_doc_content(&item.html_rel);
                 app.detail_scroll = 0;
+                // Extract fragment anchor from html_rel (e.g. "#method.add" -> "add")
+                app.detail_target = item
+                    .html_rel
+                    .split('#')
+                    .nth(1)
+                    .map(|frag| frag.split('.').last().unwrap_or(frag).to_string());
                 app.mode = AppMode::Detail;
             }
         }
@@ -653,26 +681,52 @@ fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
         );
     }
 
-    // Footer with key hints
-    let footer = Paragraph::new(Line::from(vec![
+    // Footer row: split into left (key hints) and right (tip of the day)
+    let footer_chunks = Layout::horizontal([
+        Constraint::Percentage(65),
+        Constraint::Percentage(35),
+    ])
+    .split(chunks[3]);
+
+    let keys = Line::from(vec![
         Span::styled(
             " enter ",
             Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
         ),
         Span::raw("detail  "),
         Span::styled(
+            "C-n/up ",
+            Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
+        ),
+        Span::raw("next  "),
+        Span::styled(
+            "C-p/down ",
+            Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
+        ),
+        Span::raw("prev  "),
+        Span::styled(
+            "C-f/b ",
+            Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
+        ),
+        Span::raw("page  "),
+        Span::styled(
             " esc ",
             Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
         ),
-        Span::raw("quit/clear  "),
+        Span::raw("quit  "),
         Span::styled(
-            " C-u ",
+            "C-u ",
             Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
         ),
         Span::raw("clear"),
-    ]))
-    .style(Style::default().fg(Color::Rgb(80, 100, 120)));
-    f.render_widget(footer, chunks[3]);
+    ]);
+    let tip = Line::raw("cargo doc -p <PKG> && clidoc target/doc");
+    let footer = Paragraph::new(keys).style(Style::default().fg(Color::Rgb(80, 100, 120)));
+    let tip_para = Paragraph::new(tip)
+        .style(Style::default().fg(Color::Rgb(80, 100, 120)))
+        .alignment(ratatui::layout::Alignment::Right);
+    f.render_widget(footer, footer_chunks[0]);
+    f.render_widget(tip_para, footer_chunks[1]);
 }
 
 fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
@@ -714,6 +768,20 @@ fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
 
     // Markdown content
     let visible = chunks[1].height.saturating_sub(2) as usize;
+    let target = app.detail_target.take();
+    let text = app.detail_text();
+
+    // If there's a pending fragment target, find matching heading and adjust scroll.
+    if let Some(tgt) = target {
+        if let Some(line_idx) = find_heading_line(&text.lines, &tgt) {
+            let max_s = text.lines.len().saturating_sub(visible);
+            let new_scroll = (line_idx.saturating_sub(2)).min(max_s);
+            drop(text);
+            app.detail_scroll = new_scroll as u16;
+        }
+    }
+
+    // Re-render with (possibly updated) scroll position.
     let text = app.detail_text();
     let line_count = text.lines.len();
     let max_scroll = line_count.saturating_sub(visible) as u16;
