@@ -9,11 +9,11 @@ use std::io::{Read, Write};
 use std::sync::{OnceLock, mpsc};
 use std::time::Duration;
 
-
 /// Return the path to the compiled `clidoc` binary.
 fn clidoc_bin() -> std::path::PathBuf {
     assert_cmd::Command::cargo_bin("clidoc")
-        .unwrap().get_program()
+        .unwrap()
+        .get_program()
         .into()
 }
 fn strip_styles(input: &str) -> String {
@@ -22,7 +22,7 @@ fn strip_styles(input: &str) -> String {
         // Matches standard CSI sequences (like colors/styles) but ignores raw control bytes
         Regex::new(r"[\x1b\x9b]\[[0-?]*[ -/]*[@-~]").unwrap()
     });
-    
+
     re.replace_all(input, "").into_owned()
 }
 /// Continuously read from the PTY in a background thread and collect all output.
@@ -127,7 +127,7 @@ fn search_span_add_shows_fn_add() {
         .take_writer()
         .expect("failed to take master writer");
 
-    let master = pair.master;
+    let _master = pair.master;
     // Give the app a moment to start rendering the initial frame.
     std::thread::sleep(Duration::from_millis(300));
     // Discard initial render output.

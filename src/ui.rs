@@ -62,8 +62,8 @@ pub fn run(registry: Registry, sources: Vec<DocSource>) {
     }));
 
     match result {
-        Ok(Err(e)) => {
-            //eprintln!("Error: {e}");
+        Ok(Err(_e)) => {
+            //eprintln!("Error: {_e}");
             std::process::exit(1);
         }
         Err(_panic) => {
@@ -79,6 +79,7 @@ enum AppMode {
     Search,
     Detail,
     DetailSearch,
+    #[allow(dead_code)]
     Help,
 }
 
@@ -194,9 +195,8 @@ fn process_markdown(mut text: Text<'_>) -> Text<'_> {
             continue;
         }
         if trimmed.starts_with("**") && trimmed.contains("Source") || trimmed == "Source" {
-            continue
+            continue;
         }
-
 
         // Bake base style into spans so ratatui actually paints them.
         let base = line.style;
@@ -210,17 +210,17 @@ fn process_markdown(mut text: Text<'_>) -> Text<'_> {
             }
         }
 
-
         // Strip leading "#" prefix (one or more hashes + space) from heading lines.
-        if line.style.fg.is_some() && line.style.add_modifier.contains(Modifier::BOLD) {
-            if let Some(first_span) = line.spans.first_mut() {
-                *first_span.content.to_mut() = first_span
-                    .content
-                    .as_ref()
-                    .trim_start_matches('#')
-                    .trim_start_matches(' ')
-                    .to_string();
-            }
+        if line.style.fg.is_some()
+            && line.style.add_modifier.contains(Modifier::BOLD)
+            && let Some(first_span) = line.spans.first_mut()
+        {
+            *first_span.content.to_mut() = first_span
+                .content
+                .as_ref()
+                .trim_start_matches('#')
+                .trim_start_matches(' ')
+                .to_string();
         }
 
         // Apply code styling: two-space indent + distinct foreground.
@@ -311,9 +311,9 @@ fn run_app(
                                     app.query.truncate(trimmed.len());
                                     submit_search(&mut app);
                                 }
-                                _ => { 
+                                _ => {
                                     handle_search_key(&mut app, key);
-                                },
+                                }
                             }
                         } else {
                             app.query.push(c);
@@ -360,10 +360,10 @@ fn search_worker(
         } else {
             let mut matches: Vec<(usize, i32)> = Vec::new();
             for (i, (path, kind)) in all_items.iter().enumerate() {
-                if let Some(ref kf) = kind_filter {
-                    if !kf.contains(kind) {
-                        continue;
-                    }
+                if let Some(ref kf) = kind_filter
+                    && !kf.contains(kind)
+                {
+                    continue;
                 }
                 if let Some(score) = match_item_score(path, kind, &words, case_sensitive) {
                     matches.push((i, score));
@@ -451,7 +451,7 @@ fn handle_search_key(app: &mut App, key: event::KeyEvent) -> bool {
                 app.detail_search_matches.clear();
                 app.detail_search_pos = 0;
                 if let Some(frag) = item.html_rel.split('#').nth(1) {
-                    let name = frag.split('.').last().unwrap_or(frag).to_string();
+                    let name = frag.split('.').next_back().unwrap_or(frag).to_string();
                     app.detail_search_query = name.clone();
                     run_detail_search(app, &name);
                     if !app.detail_search_matches.is_empty() {
@@ -537,8 +537,8 @@ fn handle_detail_key(app: &mut App, key: event::KeyEvent) {
         }
         KeyCode::Char('n') => {
             if !app.detail_search_matches.is_empty() {
-                app.detail_search_pos = (app.detail_search_pos + 1)
-                    % app.detail_search_matches.len();
+                app.detail_search_pos =
+                    (app.detail_search_pos + 1) % app.detail_search_matches.len();
                 scroll_to_match(app);
             }
         }
@@ -613,11 +613,7 @@ fn highlight_query<'a>(text: Text<'a>, query: &'a str) -> Text<'static> {
                     new_spans.push(Span::styled(
                         piece,
                         if is_match {
-                            patched_style.patch(
-                                Style::default()
-                                    .bg(HIGHLIGHT_BG)
-                                    .fg(HIGHLIGHT_FG),
-                            )
+                            patched_style.patch(Style::default().bg(HIGHLIGHT_BG).fg(HIGHLIGHT_FG))
                         } else {
                             patched_style
                         },
@@ -660,7 +656,10 @@ fn split_at_owned(s: &str, lower_query: &str) -> Vec<(String, bool)> {
 fn run_detail_search(app: &mut App, query: &str) {
     let text = app.detail_text();
     let lower_query = query.to_lowercase();
-    let mut matches: Vec<(usize, u8)> = text.lines.iter().enumerate()
+    let mut matches: Vec<(usize, u8)> = text
+        .lines
+        .iter()
+        .enumerate()
         .filter_map(|(i, line)| {
             let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             let lower = content.to_lowercase();
@@ -687,7 +686,8 @@ fn looks_like_signature_start(content: &str, lower_query: &str) -> bool {
     } else {
         trimmed
     };
-    let stripped = rest.strip_prefix("pub const fn ")
+    let stripped = rest
+        .strip_prefix("pub const fn ")
         .or_else(|| rest.strip_prefix("pub fn "))
         .or_else(|| rest.strip_prefix("const fn "))
         .or_else(|| rest.strip_prefix("fn "))
@@ -698,15 +698,20 @@ fn looks_like_signature_start(content: &str, lower_query: &str) -> bool {
         .or_else(|| rest.strip_prefix("pub trait "))
         .or_else(|| rest.strip_prefix("trait "))
         .unwrap_or(rest);
-    let ident_end = stripped.find(char::is_whitespace)
-        .unwrap_or(stripped.find('<').unwrap_or(stripped.find(':').unwrap_or(stripped.len())));
+    let ident_end = stripped.find(char::is_whitespace).unwrap_or(
+        stripped
+            .find('<')
+            .unwrap_or(stripped.find(':').unwrap_or(stripped.len())),
+    );
     let ident = stripped[..ident_end].trim();
     ident.eq_ignore_ascii_case(lower_query)
 }
 
 /// Scroll so that `detail_search_matches[detail_search_pos]` is visible near top.
 fn scroll_to_match(app: &mut App) {
-    if app.detail_search_matches.is_empty() || app.detail_search_pos >= app.detail_search_matches.len() {
+    if app.detail_search_matches.is_empty()
+        || app.detail_search_pos >= app.detail_search_matches.len()
+    {
         return;
     }
     let target_line = app.detail_search_matches[app.detail_search_pos];
@@ -867,11 +872,9 @@ fn render_search(f: &mut Frame, app: &mut App, size: Rect) {
     }
 
     // Footer row: split into left (key hints) and right (tip of the day)
-    let footer_chunks = Layout::horizontal([
-        Constraint::Percentage(65),
-        Constraint::Percentage(35),
-    ])
-    .split(chunks[3]);
+    let footer_chunks =
+        Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .split(chunks[3]);
 
     let keys = Line::from(vec![
         Span::styled(
@@ -988,10 +991,7 @@ fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
             Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
         ),
         Span::raw("page  "),
-        Span::styled(
-            " / ",
-            Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
-        ),
+        Span::styled(" / ", Style::default().fg(Color::Rgb(140, 180, 200)).bold()),
         Span::raw("search  "),
         Span::styled(
             " n/N ",
@@ -1002,12 +1002,20 @@ fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
 
     // Show active search indicator.
     if !app.detail_search_query.is_empty() && !app.detail_search_matches.is_empty() {
-        let pos_str = format!(" {}:{} ", app.detail_search_pos + 1, app.detail_search_matches.len());
-        footer_spans.push(Span::styled(pos_str,
-            Style::default().fg(Color::Rgb(255, 220, 100)).bold()));
+        let pos_str = format!(
+            " {}:{} ",
+            app.detail_search_pos + 1,
+            app.detail_search_matches.len()
+        );
+        footer_spans.push(Span::styled(
+            pos_str,
+            Style::default().fg(Color::Rgb(255, 220, 100)).bold(),
+        ));
     } else if !app.detail_search_query.is_empty() {
-        footer_spans.push(Span::styled(" no matches ",
-            Style::default().fg(Color::Rgb(255, 100, 100)).bold()));
+        footer_spans.push(Span::styled(
+            " no matches ",
+            Style::default().fg(Color::Rgb(255, 100, 100)).bold(),
+        ));
     }
 
     let footer = Paragraph::new(Line::from(footer_spans))
@@ -1017,11 +1025,12 @@ fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
     // Overlay search bar when in DetailSearch mode.
     if app.mode == AppMode::DetailSearch {
         let bar_text = format!(" / {}█", app.detail_search_query);
-        let bar = Paragraph::new(Line::from(vec![
-            Span::styled(bar_text, Style::default()
+        let bar = Paragraph::new(Line::from(vec![Span::styled(
+            bar_text,
+            Style::default()
                 .bg(Color::Rgb(60, 70, 80))
-                .fg(Color::Rgb(255, 220, 100))),
-        ]));
+                .fg(Color::Rgb(255, 220, 100)),
+        )]));
         f.render_widget(Clear, chunks[2]);
         f.render_widget(bar, chunks[2]);
     }
@@ -1297,5 +1306,4 @@ fn main() {
             }
         }
     }
-
 }

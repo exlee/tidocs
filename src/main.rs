@@ -17,7 +17,7 @@ struct Cli {
     query: Option<String>,
 
     /// Show full doc details for the first match (non-interactive mode)
-    #[arg(long, requires = "query")]
+    #[arg(long, short, requires = "query")]
     details: bool,
 }
 
@@ -38,6 +38,19 @@ fn main() {
             if cli.details {
                 if let Some(item) = results.first() {
                     let doc = registry.load_doc_content(&item.html_rel);
+                    let doc = doc
+                        .lines()
+                        .filter_map(|l| cleanup_markdown(l))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        .replace("\n\n", "\n");
+
+                    let doc = if doc.len() > 0 && doc.chars().rev().next().unwrap() != '\n' {
+                        format!("{}\n", doc)
+                    } else {
+                        doc
+                    };
+
                     print!("{doc}");
                 } else {
                     eprintln!("No matching items found.");
@@ -56,4 +69,15 @@ fn main() {
             ui::run(registry, sources);
         }
     }
+}
+
+fn cleanup_markdown(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed.starts_with("```") {
+        return None;
+    }
+    if trimmed.starts_with("**") && trimmed.contains("Source") || trimmed == "Source" {
+        return None;
+    }
+    Some(trimmed)
 }

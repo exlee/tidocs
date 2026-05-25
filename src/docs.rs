@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -52,12 +52,6 @@ pub struct DocSource {
     pub path: PathBuf,
 }
 
-impl DocSource {
-    pub fn label(&self) -> String {
-        format!("{} v{}", self.lib_name, self.version)
-    }
-}
-
 /// Registry of all doc items, loaded from SQLite cache or HTML files.
 pub struct Registry {
     items: Vec<DocItem>,
@@ -83,9 +77,17 @@ impl Registry {
                     for entry in rd.flatten() {
                         let sub = entry.path();
                         if sub.is_dir() && read_dir_has_sidebar(&sub) {
-                            let name = sub.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+                            let name = sub
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("unknown")
+                                .to_string();
                             let ver = detect_version(&sub).unwrap_or_else(|| "0.0.0".to_string());
-                            sources.push(DocSource { lib_name: name, version: ver, path: sub });
+                            sources.push(DocSource {
+                                lib_name: name,
+                                version: ver,
+                                path: sub,
+                            });
                             found = true;
                         }
                     }
@@ -93,9 +95,17 @@ impl Registry {
             }
             if !found && read_dir_has_sidebar(&root) {
                 // Single crate root
-                let name = root.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+                let name = root
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
                 let ver = detect_version(&root).unwrap_or_else(|| "0.0.0".to_string());
-                sources.push(DocSource { lib_name: name, version: ver, path: root });
+                sources.push(DocSource {
+                    lib_name: name,
+                    version: ver,
+                    path: root,
+                });
             }
         }
 
@@ -106,25 +116,40 @@ impl Registry {
 
         for source in &sources {
             let source_key = source_key(&source.lib_name, &source.version);
-            let crate_dir_prefix = source.path.file_name()
+            let crate_dir_prefix = source
+                .path
+                .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown")
                 .to_string();
-            source_map.insert(crate_dir_prefix.clone(), (source.lib_name.clone(), source.version.clone()));
+            source_map.insert(
+                crate_dir_prefix.clone(),
+                (source.lib_name.clone(), source.version.clone()),
+            );
 
             if db_needs_scan(&source.lib_name, &source.version, &source.path) {
                 let mut items = Vec::new();
                 load_crate(&source.path, &source.lib_name, &mut items);
                 items.sort_by(|a, b| a.path.cmp(&b.path));
                 items.dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
-                db_save_items(&source_key, &source.path, &source.lib_name, &source.version, &items);
+                db_save_items(
+                    &source_key,
+                    &source.path,
+                    &source.lib_name,
+                    &source.version,
+                    &items,
+                );
                 // Cache HTML pages into DB
-                cache_pages_for_items(&crate_dir_prefix, &source.lib_name, &source.version, &source.path, &items);
+                cache_pages_for_items(
+                    &crate_dir_prefix,
+                    &source.lib_name,
+                    &source.version,
+                    &source.path,
+                    &items,
+                );
                 all_items.extend(items);
-            } else {
-                if let Some(cached) = db_load_items(&source_key) {
-                    all_items.extend(cached);
-                }
+            } else if let Some(cached) = db_load_items(&source_key) {
+                all_items.extend(cached);
             }
             active_sources.push(source.clone());
         }
@@ -137,7 +162,11 @@ impl Registry {
         (Self::new(all_items, roots, source_map), active_sources)
     }
 
-    fn new(items: Vec<DocItem>, doc_roots: Vec<PathBuf>, source_map: HashMap<String, (String, String)>) -> Self {
+    fn new(
+        items: Vec<DocItem>,
+        doc_roots: Vec<PathBuf>,
+        source_map: HashMap<String, (String, String)>,
+    ) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -157,15 +186,13 @@ impl Registry {
     /// Merge cached sources from DB into this registry.
     /// Used when filesystem discovery yields no sources but DB has cached data.
     pub fn merge_cached(&mut self) -> Vec<DocSource> {
-        let conn = match rusqlite::Connection::open(&db_path()) {
+        let conn = match rusqlite::Connection::open(db_path()) {
             Ok(c) => c,
             Err(_) => return Vec::new(),
         };
         db_ensure_tables(&conn);
 
-        let mut stmt = match conn.prepare(
-            "SELECT lib_name, version FROM sources"
-        ) {
+        let mut stmt = match conn.prepare("SELECT lib_name, version FROM sources") {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -179,21 +206,31 @@ impl Registry {
         let mut new_sources = Vec::new();
         for (lib_name, version) in rows {
             // Skip if already loaded
-            if self.source_map.values().any(|(l, v)| l == &lib_name && v == &version) {
+            if self
+                .source_map
+                .values()
+                .any(|(l, v)| l == &lib_name && v == &version)
+            {
                 continue;
             }
             let key = source_key(&lib_name, &version);
             if let Some(items) = db_load_items(&key) {
                 let crate_prefix = lib_name.clone();
-                self.source_map.insert(crate_prefix, (lib_name.clone(), version.clone()));
+                self.source_map
+                    .insert(crate_prefix, (lib_name.clone(), version.clone()));
                 self.items.extend(items);
-                let path_str: String = conn.query_row(
-                    "SELECT path FROM sources WHERE lib_name = ?1 AND version = ?2",
-                    params![&lib_name, &version],
-                    |row| row.get(0),
-                ).unwrap_or_default();
+                let path_str: String = conn
+                    .query_row(
+                        "SELECT path FROM sources WHERE lib_name = ?1 AND version = ?2",
+                        params![&lib_name, &version],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or_default();
                 let path = PathBuf::from(&path_str);
-                let parent = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.clone());
+                let parent = path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| path.clone());
                 if !self.doc_roots.contains(&parent) {
                     self.doc_roots.push(parent);
                 }
@@ -205,8 +242,10 @@ impl Registry {
             }
         }
 
-        self.items.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.kind.cmp(&b.kind)));
-        self.items.dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
+        self.items
+            .sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.kind.cmp(&b.kind)));
+        self.items
+            .dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
         if !new_sources.is_empty() {
             // Already printed total above; just note what was added
         }
@@ -232,10 +271,10 @@ impl Registry {
             .items
             .iter()
             .filter_map(|item| {
-                if let Some(ref kf) = kind_filter {
-                    if !kf.contains(&item.kind) {
-                        return None;
-                    }
+                if let Some(ref kf) = kind_filter
+                    && !kf.contains(&item.kind)
+                {
+                    return None;
                 }
                 let score = match_item_score(&item.path, &item.kind, &words, case_sensitive)?;
                 Some((item, score))
@@ -262,13 +301,16 @@ impl Registry {
         let content = if let Some((lib_name, version)) = self.source_map.get(crate_prefix) {
             db_load_page_html(lib_name, version, html_rel)
                 .as_deref()
-                .map(|s| render_doc_page(s))
+                .map(render_doc_page)
         } else {
             None
         };
 
         let content = content.unwrap_or_else(|| self.convert_html(html_rel));
-        self.content_cache.lock().unwrap().insert(html_rel.to_string(), content.clone());
+        self.content_cache
+            .lock()
+            .unwrap()
+            .insert(html_rel.to_string(), content.clone());
         content
     }
 
@@ -286,8 +328,12 @@ impl Registry {
                 let file_rel = rel.split('#').next().unwrap_or("").to_string();
                 'roots: for root in &roots {
                     let html_path = root.join(&file_rel);
-                    if !html_path.exists() { continue; }
-                    let Ok(raw) = fs::read_to_string(&html_path) else { continue; };
+                    if !html_path.exists() {
+                        continue;
+                    }
+                    let Ok(raw) = fs::read_to_string(&html_path) else {
+                        continue;
+                    };
                     let content = render_doc_page(&raw);
                     cache.lock().unwrap().insert(rel.clone(), content);
                     break 'roots;
@@ -302,8 +348,12 @@ impl Registry {
         let file_rel = html_rel.split('#').next().unwrap_or(html_rel);
         for root in &self.doc_roots {
             let html_path = root.join(file_rel);
-            if !html_path.exists() { continue; }
-            let Ok(raw) = fs::read_to_string(&html_path) else { continue; };
+            if !html_path.exists() {
+                continue;
+            }
+            let Ok(raw) = fs::read_to_string(&html_path) else {
+                continue;
+            };
             return render_doc_page(&raw);
         }
         format!("Documentation file not found: {}", file_rel)
@@ -350,16 +400,15 @@ fn db_ensure_tables(conn: &rusqlite::Connection) {
             html_rel TEXT NOT NULL,
             html     BLOB NOT NULL,
             PRIMARY KEY (lib_name, version, html_rel)
-        );"
+        );",
     );
 }
 
 /// Compress a string with zlib deflate.
 fn compress(text: &str) -> Option<Vec<u8>> {
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(text.as_bytes()).ok()?
-    ;
-    Some(encoder.finish().ok()?)
+    encoder.write_all(text.as_bytes()).ok()?;
+    encoder.finish().ok()
 }
 
 /// Decompress zlib-deflated bytes back to string.
@@ -372,18 +421,26 @@ fn decompress(data: &[u8]) -> Option<String> {
 
 /// Load raw HTML from DB cache (compressed).
 fn db_load_page_html(lib_name: &str, version: &str, html_rel: &str) -> Option<String> {
-    let conn = rusqlite::Connection::open(&db_path()).ok()?;
+    let conn = rusqlite::Connection::open(db_path()).ok()?;
     db_ensure_tables(&conn);
     let file_rel = html_rel.split('#').next().unwrap_or(html_rel);
-    let mut stmt = conn.prepare(
-        "SELECT html FROM pages WHERE lib_name = ?1 AND version = ?2 AND html_rel = ?3"
-    ).ok()?;
-    let data: Vec<u8> = stmt.query_row(params![lib_name, version, file_rel], |row| row.get(0)).ok()?;
+    let mut stmt = conn
+        .prepare("SELECT html FROM pages WHERE lib_name = ?1 AND version = ?2 AND html_rel = ?3")
+        .ok()?;
+    let data: Vec<u8> = stmt
+        .query_row(params![lib_name, version, file_rel], |row| row.get(0))
+        .ok()?;
     decompress(&data)
 }
 
 /// Cache all unique HTML pages referenced by items.
-fn cache_pages_for_items(_crate_prefix: &str, lib_name: &str, version: &str, crate_dir: &Path, items: &[DocItem]) {
+fn cache_pages_for_items(
+    _crate_prefix: &str,
+    lib_name: &str,
+    version: &str,
+    crate_dir: &Path,
+    items: &[DocItem],
+) {
     // Collect unique base HTML files (strip fragment anchors)
     let mut seen: HashSet<&str> = HashSet::new();
     let mut html_files: Vec<&str> = Vec::new();
@@ -397,7 +454,7 @@ fn cache_pages_for_items(_crate_prefix: &str, lib_name: &str, version: &str, cra
     // Resolve against the doc root (parent of crate dir)
     let doc_root = crate_dir.parent().unwrap_or(crate_dir);
 
-    let mut conn = match rusqlite::Connection::open(&db_path()) {
+    let mut conn = match rusqlite::Connection::open(db_path()) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -415,14 +472,16 @@ fn cache_pages_for_items(_crate_prefix: &str, lib_name: &str, version: &str, cra
     };
     {
         let mut stmt = match tx.prepare(
-            "INSERT INTO pages (lib_name, version, html_rel, html) VALUES (?1, ?2, ?3, ?4)"
+            "INSERT INTO pages (lib_name, version, html_rel, html) VALUES (?1, ?2, ?3, ?4)",
         ) {
             Ok(s) => s,
             Err(_) => return,
         };
         for file_rel in html_files {
             let path = doc_root.join(file_rel);
-            let Ok(raw) = fs::read_to_string(&path) else { continue; };
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
             let compressed = match compress(&raw) {
                 Some(c) => c,
                 None => continue,
@@ -438,25 +497,39 @@ fn compute_fingerprint(crate_dir: &Path) -> Option<String> {
 
     let all = crate_dir.join("all.html");
     if all.exists() {
-        let mtime = fs::metadata(&all).ok()?.modified().ok()?
-            .duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+        let mtime = fs::metadata(&all)
+            .ok()?
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
         entries.push(("all.html".into(), mtime));
     }
 
     if let Ok(rd) = fs::read_dir(crate_dir) {
         for entry in rd.flatten() {
             let p = entry.path();
-            if !p.is_file() { continue; }
+            if !p.is_file() {
+                continue;
+            }
             let name = p.file_name()?.to_str()?.to_string();
             if name.starts_with("sidebar-items") && name.ends_with(".js") {
-                let mtime = fs::metadata(&p).ok()?.modified().ok()?
-                    .duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+                let mtime = fs::metadata(&p)
+                    .ok()?
+                    .modified()
+                    .ok()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_secs();
                 entries.push((name, mtime));
             }
         }
     }
 
-    if entries.is_empty() { return None; }
+    if entries.is_empty() {
+        return None;
+    }
 
     entries.sort();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -468,7 +541,7 @@ fn compute_fingerprint(crate_dir: &Path) -> Option<String> {
 }
 
 fn db_needs_scan(lib_name: &str, version: &str, crate_dir: &Path) -> bool {
-    let conn = match rusqlite::Connection::open(&db_path()) {
+    let conn = match rusqlite::Connection::open(db_path()) {
         Ok(c) => c,
         Err(_) => return true,
     };
@@ -478,11 +551,13 @@ fn db_needs_scan(lib_name: &str, version: &str, crate_dir: &Path) -> bool {
         Some(fp) => fp,
         None => {
             // Files not on disk -- check if we have cached data to fall back on
-            let has_cache: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sources WHERE lib_name = ?1 AND version = ?2)",
-                params![lib_name, version],
-                |row| row.get(0),
-            ).unwrap_or(false);
+            let has_cache: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sources WHERE lib_name = ?1 AND version = ?2)",
+                    params![lib_name, version],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
             return !has_cache; // needs_scan=false if cache exists
         }
     };
@@ -500,17 +575,16 @@ fn db_needs_scan(lib_name: &str, version: &str, crate_dir: &Path) -> bool {
         "SELECT path FROM sources WHERE lib_name = ?1 AND version = ?2",
         params![lib_name, version],
         |row| row.get(0),
-    ) {
-        if path_str != crate_dir.display().to_string() {
-            return true; // path changed, must rescan
-        }
+    ) && path_str != crate_dir.display().to_string()
+    {
+        return true; // path changed, must rescan
     }
 
     stored.as_deref() != Some(&fp)
 }
 
 fn db_load_items(key: &str) -> Option<Vec<DocItem>> {
-    let conn = rusqlite::Connection::open(&db_path()).ok()?;
+    let conn = rusqlite::Connection::open(db_path()).ok()?;
     db_ensure_tables(&conn);
 
     let (lib_name, version) = key.split_once('@')?;
@@ -536,7 +610,7 @@ fn db_load_items(key: &str) -> Option<Vec<DocItem>> {
 }
 
 fn db_save_items(_key: &str, crate_dir: &Path, lib_name: &str, version: &str, items: &[DocItem]) {
-    let mut conn = match rusqlite::Connection::open(&db_path()) {
+    let mut conn = match rusqlite::Connection::open(db_path()) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -569,7 +643,14 @@ fn db_save_items(_key: &str, crate_dir: &Path, lib_name: &str, version: &str, it
             Err(_) => return,
         };
         for item in items {
-            let _ = stmt.execute(params![lib_name, version, &item.path, &item.kind, &item.html_rel, &item.desc]);
+            let _ = stmt.execute(params![
+                lib_name,
+                version,
+                &item.path,
+                &item.kind,
+                &item.html_rel,
+                &item.desc
+            ]);
         }
     }
     let _ = tx.commit();
@@ -606,13 +687,13 @@ fn detect_version(crate_dir: &Path) -> Option<String> {
             if let Ok(content) = fs::read_to_string(&toml) {
                 for line in content.lines() {
                     let trimmed = line.trim();
-                    if trimmed.starts_with("version") {
-                        if let Some(rest) = trimmed.strip_prefix("version") {
-                            let rest = rest.trim_start_matches('=').trim();
-                            let ver = rest.trim_start_matches('"').trim_end_matches('"').trim();
-                            if !ver.is_empty() {
-                                return Some(ver.to_string());
-                            }
+                    if trimmed.starts_with("version")
+                        && let Some(rest) = trimmed.strip_prefix("version")
+                    {
+                        let rest = rest.trim_start_matches('=').trim();
+                        let ver = rest.trim_start_matches('"').trim_end_matches('"').trim();
+                        if !ver.is_empty() {
+                            return Some(ver.to_string());
                         }
                     }
                 }
@@ -662,21 +743,34 @@ fn discover_doc_sources() -> Vec<DocSource> {
         if let Ok(rd) = fs::read_dir(&rustup_base) {
             for entry in rd.flatten() {
                 let p = entry.path();
-                if !p.is_dir() { continue; }
+                if !p.is_dir() {
+                    continue;
+                }
                 let doc_dir = p.join("share/doc/rust/html");
-                if !doc_dir.is_dir() { continue; }
-                let tc_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+                if !doc_dir.is_dir() {
+                    continue;
+                }
+                let tc_name = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
                 toolchains.push((doc_dir, tc_name));
             }
         }
 
         // Keep only active toolchain
-        if toolchains.len() > 1 {
-            if let Ok(output) = std::process::Command::new("rustup").args(["show", "active-toolchain"]).output() {
-                let active = String::from_utf8_lossy(&output.stdout)
-                    .split_whitespace().next().unwrap_or("").to_string();
-                toolchains.retain(|(_, name)| name == &active);
-            }
+        if toolchains.len() > 1
+            && let Ok(output) = std::process::Command::new("rustup")
+                .args(["show", "active-toolchain"])
+                .output()
+        {
+            let active = String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            toolchains.retain(|(_, name)| name == &active);
         }
 
         // Determine version once (same for all crates in a toolchain)
@@ -686,8 +780,14 @@ fn discover_doc_sources() -> Vec<DocSource> {
             if let Ok(rd) = fs::read_dir(doc_dir) {
                 for entry in rd.flatten() {
                     let sub = entry.path();
-                    if !sub.is_dir() || !read_dir_has_sidebar(&sub) { continue; }
-                    let crate_name = sub.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+                    if !sub.is_dir() || !read_dir_has_sidebar(&sub) {
+                        continue;
+                    }
+                    let crate_name = sub
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
                     sources.push(DocSource {
                         lib_name: crate_name,
                         version: ver.clone(),
@@ -732,7 +832,12 @@ pub(crate) fn has_uppercase(query: &str) -> bool {
     query.chars().any(|c| c.is_ascii_uppercase())
 }
 
-pub(crate) fn match_item_score(path: &str, _kind: &str, words: &[&str], case_sensitive: bool) -> Option<i32> {
+pub(crate) fn match_item_score(
+    path: &str,
+    _kind: &str,
+    words: &[&str],
+    case_sensitive: bool,
+) -> Option<i32> {
     let (search_path, needs_lower) = if case_sensitive {
         (Cow::Borrowed(path), false)
     } else {
@@ -791,7 +896,9 @@ fn read_dir_has_sidebar(dir: &Path) -> bool {
 }
 
 fn has_crate_subdirs(dir: &Path) -> bool {
-    if !dir.is_dir() { return false; }
+    if !dir.is_dir() {
+        return false;
+    }
     fs::read_dir(dir)
         .map(|entries| {
             entries
@@ -803,9 +910,14 @@ fn has_crate_subdirs(dir: &Path) -> bool {
 
 /// Load all items for a single crate from its doc HTML directory.
 fn load_crate(base: &Path, crate_name: &str, items: &mut Vec<DocItem>) {
-    if !base.exists() || !base.is_dir() { return; }
+    if !base.exists() || !base.is_dir() {
+        return;
+    }
 
-    let crate_dir_name = base.file_name().and_then(|n| n.to_str()).unwrap_or(crate_name);
+    let crate_dir_name = base
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(crate_name);
 
     load_all_html(base, crate_name, crate_dir_name, items);
     load_methods(base, items);
@@ -814,11 +926,12 @@ fn load_crate(base: &Path, crate_name: &str, items: &mut Vec<DocItem>) {
     if let Ok(entries) = fs::read_dir(base) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() && path.file_name().is_some_and(|n| n != "." && n != "..") {
-                if read_dir_has_sidebar(&path) {
-                    let sub_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    load_submodule(&path, crate_name, crate_dir_name, sub_name, items);
-                }
+            if path.is_dir()
+                && path.file_name().is_some_and(|n| n != "." && n != "..")
+                && read_dir_has_sidebar(&path)
+            {
+                let sub_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                load_submodule(&path, crate_name, crate_dir_name, sub_name, items);
             }
         }
     }
@@ -827,7 +940,12 @@ fn load_crate(base: &Path, crate_name: &str, items: &mut Vec<DocItem>) {
 fn load_methods(base: &Path, items: &mut Vec<DocItem>) {
     let method_holders: Vec<(String, String)> = items
         .iter()
-        .filter(|item| matches!(item.kind.as_str(), "struct" | "enum" | "trait" | "primitive" | "union"))
+        .filter(|item| {
+            matches!(
+                item.kind.as_str(),
+                "struct" | "enum" | "trait" | "primitive" | "union"
+            )
+        })
         .map(|item| (item.path.clone(), item.html_rel.clone()))
         .collect();
 
@@ -842,7 +960,9 @@ fn load_methods(base: &Path, items: &mut Vec<DocItem>) {
 
     for (parent_path, html_rel) in method_holders {
         let html_path = file_root.join(&html_rel);
-        let Ok(raw) = fs::read_to_string(&html_path) else { continue; };
+        let Ok(raw) = fs::read_to_string(&html_path) else {
+            continue;
+        };
 
         for cap in re.captures_iter(&raw) {
             let anchor_type = &cap[1];
@@ -853,7 +973,9 @@ fn load_methods(base: &Path, items: &mut Vec<DocItem>) {
                 "const" => "assoc_const",
                 _ => continue,
             };
-            if !seen.insert(format!("{parent_path}::{name}")) { continue; }
+            if !seen.insert(format!("{parent_path}::{name}")) {
+                continue;
+            }
             let frag = format!("#{anchor_type}.{name}");
             new_items.push(DocItem {
                 path: format!("{parent_path}::{name}"),
@@ -868,8 +990,12 @@ fn load_methods(base: &Path, items: &mut Vec<DocItem>) {
 
 fn load_all_html(base: &Path, crate_name: &str, crate_dir_name: &str, items: &mut Vec<DocItem>) {
     let all_html = base.join("all.html");
-    if !all_html.exists() { return; }
-    let Ok(content) = fs::read_to_string(&all_html) else { return; };
+    if !all_html.exists() {
+        return;
+    }
+    let Ok(content) = fs::read_to_string(&all_html) else {
+        return;
+    };
 
     for (kind, pos) in extract_all_sections(&content) {
         for (href, text) in extract_links_in_section(&content, pos) {
@@ -959,12 +1085,21 @@ fn extract_links_in_section(html: &str, section_start: usize) -> Vec<(String, St
 
 fn detect_section_kind(line: &str) -> Option<String> {
     let patterns: &[(&str, &str)] = &[
-        ("modules", "mod"), ("structs", "struct"), ("enums", "enum"),
-        ("functions", "fn"), ("traits", "trait"), ("type-aliases", "type"),
-        ("types", "type"), ("constants", "const"), ("macros", "macro"),
-        ("primitives", "primitive"), ("keywords", "keyword"),
-        ("trait-aliases", "trait"), ("reexports", "reexport"),
-        ("methods", "method"), ("associated-types", "assoc_type"),
+        ("modules", "mod"),
+        ("structs", "struct"),
+        ("enums", "enum"),
+        ("functions", "fn"),
+        ("traits", "trait"),
+        ("type-aliases", "type"),
+        ("types", "type"),
+        ("constants", "const"),
+        ("macros", "macro"),
+        ("primitives", "primitive"),
+        ("keywords", "keyword"),
+        ("trait-aliases", "trait"),
+        ("reexports", "reexport"),
+        ("methods", "method"),
+        ("associated-types", "assoc_type"),
         ("associated-consts", "assoc_const"),
     ];
 
@@ -976,10 +1111,17 @@ fn detect_section_kind(line: &str) -> Option<String> {
     }
 
     let heading_kinds: &[(&str, &str)] = &[
-        ("re-exports", "reexport"), ("modules", "mod"), ("structs", "struct"),
-        ("enums", "enum"), ("functions", "fn"), ("traits", "trait"),
-        ("type aliases", "type"), ("constants", "const"), ("macros", "macro"),
-        ("primitive types", "primitive"), ("keywords", "keyword"),
+        ("re-exports", "reexport"),
+        ("modules", "mod"),
+        ("structs", "struct"),
+        ("enums", "enum"),
+        ("functions", "fn"),
+        ("traits", "trait"),
+        ("type aliases", "type"),
+        ("constants", "const"),
+        ("macros", "macro"),
+        ("primitive types", "primitive"),
+        ("keywords", "keyword"),
         ("trait aliases", "trait"),
     ];
 
@@ -996,7 +1138,13 @@ fn detect_section_kind(line: &str) -> Option<String> {
     None
 }
 
-fn load_submodule(dir: &Path, crate_name: &str, crate_dir_name: &str, module_path: &str, items: &mut Vec<DocItem>) {
+fn load_submodule(
+    dir: &Path,
+    crate_name: &str,
+    crate_dir_name: &str,
+    module_path: &str,
+    items: &mut Vec<DocItem>,
+) {
     let sidebar = load_sidebar(dir);
     for (kind, names) in &sidebar {
         for name in names {
@@ -1056,7 +1204,8 @@ fn load_sidebar(dir: &Path) -> HashMap<String, Vec<String>> {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("sidebar-items") && name.ends_with(".js")
+            if name.starts_with("sidebar-items")
+                && name.ends_with(".js")
                 && let Ok(content) = fs::read_to_string(entry.path())
             {
                 parse_sidebar_items_js(&content, &mut result);
@@ -1067,9 +1216,13 @@ fn load_sidebar(dir: &Path) -> HashMap<String, Vec<String>> {
 }
 
 fn parse_sidebar_items_js(content: &str, out: &mut HashMap<String, Vec<String>>) {
-    let Some(eq_pos) = content.find('=') else { return; };
+    let Some(eq_pos) = content.find('=') else {
+        return;
+    };
     let json_str = content[eq_pos + 1..].trim().trim_end_matches(';').trim();
-    if let Ok(map) = serde_json::from_str::<std::collections::BTreeMap<String, Vec<String>>>(json_str) {
+    if let Ok(map) =
+        serde_json::from_str::<std::collections::BTreeMap<String, Vec<String>>>(json_str)
+    {
         for (kind, names) in map {
             out.insert(kind, names);
         }
@@ -1077,11 +1230,19 @@ fn parse_sidebar_items_js(content: &str, out: &mut HashMap<String, Vec<String>>)
 }
 
 fn build_html_rel_in_crate(dir: &Path, crate_dir_name: &str, kind: &str, name: &str) -> String {
-    format!("{}/{}", path_relative_to_crate_dir(dir, crate_dir_name), html_filename_for_kind(kind, name))
+    format!(
+        "{}/{}",
+        path_relative_to_crate_dir(dir, crate_dir_name),
+        html_filename_for_kind(kind, name)
+    )
 }
 
 fn build_submodule_html_rel(dir: &Path, crate_dir_name: &str, href: &str) -> String {
-    format!("{}/{}", path_relative_to_crate_dir(dir, crate_dir_name), href)
+    format!(
+        "{}/{}",
+        path_relative_to_crate_dir(dir, crate_dir_name),
+        href
+    )
 }
 
 fn path_relative_to_crate_dir(dir: &Path, crate_dir_name: &str) -> String {
@@ -1123,7 +1284,7 @@ fn html_filename_for_kind(kind: &str, name: &str) -> String {
     }
 }
 
-/// Extract the <main> content from rustdoc HTML and render as readable text
+/// Extract the `<main>` content from rustdoc HTML and render as readable text
 pub fn render_doc_page(html: &str) -> String {
     let main_content = if let Some(start) = html.find("<main>") {
         let after_main = &html[start + 6..];
@@ -1148,12 +1309,12 @@ pub fn render_doc_page(html: &str) -> String {
         .replace("</h4>", "</h3>");
 
     let options = html_to_markdown_rs::ConversionOptions::builder()
-        .strip_tags(vec!["a".into()])       // keep link text, drop [text](url)
+        .strip_tags(vec!["a".into()]) // keep link text, drop [text](url)
         .exclude_selectors(vec![
-            ".anchor".into(),               // rustdoc § anchors
-            "#rustdoc-nav".into(),          // sidebar nav
-            ".sidebar-links".into(),        // sidebar links
-            ".location".into(),             // breadcrumb location
+            ".anchor".into(),        // rustdoc § anchors
+            "#rustdoc-nav".into(),   // sidebar nav
+            ".sidebar-links".into(), // sidebar links
+            ".location".into(),      // breadcrumb location
         ])
         .build();
 
@@ -1176,24 +1337,25 @@ fn clean_rendered_text(rendered: &str) -> String {
         }
 
         let text = if in_code_block {
-            *line  // preserve indentation inside code blocks
+            *line // preserve indentation inside code blocks
         } else {
             line.trim()
         };
 
         // Unwrap bold-wrapped headings: **### ...** → ### ...
         // Also strip trailing "**" on heading lines (rustdoc artifact).
-        let owned_text: String = if text.starts_with("**#") && text.ends_with("**") && text.contains(" ") {
-            text[2..text.len() - 2].to_string()
-        } else if let Some(after_hash) = text.strip_prefix("##") {
-            if let Some(clean) = after_hash.strip_suffix("**") {
-                format!("##{}", clean)
+        let owned_text: String =
+            if text.starts_with("**#") && text.ends_with("**") && text.contains(" ") {
+                text[2..text.len() - 2].to_string()
+            } else if let Some(after_hash) = text.strip_prefix("##") {
+                if let Some(clean) = after_hash.strip_suffix("**") {
+                    format!("##{}", clean)
+                } else {
+                    text.to_string()
+                }
             } else {
                 text.to_string()
-            }
-        } else {
-            text.to_string()
-        };
+            };
         let text = owned_text.as_str();
 
         if text == "Copy item path"
@@ -1204,9 +1366,14 @@ fn clean_rendered_text(rendered: &str) -> String {
             continue;
         }
         if text.is_empty() {
-            if !prev_blank { output.push('\n'); prev_blank = true; }
+            if !prev_blank {
+                output.push('\n');
+                prev_blank = true;
+            }
         } else {
-            if prev_blank && !output.is_empty() { output.push('\n'); }
+            if prev_blank && !output.is_empty() {
+                output.push('\n');
+            }
             output.push_str(text);
             output.push('\n');
             prev_blank = false;
@@ -1237,7 +1404,9 @@ pub fn discover_doc_root(path: &Path) -> PathBuf {
     }
     if path.join("Cargo.toml").exists() {
         let td = path.join("target/doc");
-        if td.exists() { return td; }
+        if td.exists() {
+            return td;
+        }
         eprintln!("Hint: run 'cargo doc' in {} first", path.display());
         std::process::exit(1);
     }
