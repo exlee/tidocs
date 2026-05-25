@@ -73,11 +73,8 @@ fn main() {
 
 fn cleanup_markdown(line: &str) -> Option<&str> {
     let trimmed = line.trim();
-    if trimmed.starts_with("```") {
-        return None;
-    }
     if trimmed.starts_with("**") && trimmed.contains("Source") || trimmed == "Source" {
         return None;
     }
-    Some(trimmed)
+    Some(line)
 }
