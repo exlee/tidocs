@@ -1182,11 +1182,19 @@ fn clean_rendered_text(rendered: &str) -> String {
         };
 
         // Unwrap bold-wrapped headings: **### ...** → ### ...
-        let text = if text.starts_with("**#") && text.ends_with("**") && text.contains(" ") {
-            &text[2..text.len() - 2]
+        // Also strip trailing "**" on heading lines (rustdoc artifact).
+        let owned_text: String = if text.starts_with("**#") && text.ends_with("**") && text.contains(" ") {
+            text[2..text.len() - 2].to_string()
+        } else if let Some(after_hash) = text.strip_prefix("##") {
+            if let Some(clean) = after_hash.strip_suffix("**") {
+                format!("##{}", clean)
+            } else {
+                text.to_string()
+            }
         } else {
-            text
+            text.to_string()
         };
+        let text = owned_text.as_str();
 
         if text == "Copy item path"
             || text == "Expand description"

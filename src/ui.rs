@@ -12,7 +12,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{
         Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
-        ScrollbarOrientation, ScrollbarState, Wrap,
+        ScrollbarOrientation, ScrollbarState,
     },
 };
 use std::io::{self, Stdout};
@@ -63,20 +63,22 @@ pub fn run(registry: Registry, sources: Vec<DocSource>) {
 
     match result {
         Ok(Err(e)) => {
-            eprintln!("Error: {e}");
+            //eprintln!("Error: {e}");
             std::process::exit(1);
         }
         Err(_panic) => {
-            eprintln!("Panic occurred");
+            //eprintln!("Panic occurred");
             std::process::exit(101);
         }
         Ok(Ok(())) => {}
     }
 }
 
+#[derive(PartialEq)]
 enum AppMode {
     Search,
     Detail,
+    DetailSearch,
     Help,
 }
 
@@ -102,8 +104,12 @@ struct App {
     list_state: ListState,
     detail_md: String,
     detail_scroll: u16,
-    /// Fragment anchor to scroll to on first render (e.g. "method.add").
-    detail_target: Option<String>,
+    /// In-detail search query (`/`).
+    detail_search_query: String,
+    /// Indices of matching lines for current detail search.
+    detail_search_matches: Vec<usize>,
+    /// Current position in detail_search_matches.
+    detail_search_pos: usize,
     /// Send search requests to the worker.
     tx: mpsc::Sender<SearchRequest>,
     /// Receive search results from the worker.
@@ -187,6 +193,10 @@ fn process_markdown(mut text: Text<'_>) -> Text<'_> {
         if trimmed.starts_with("```") {
             continue;
         }
+        if trimmed.starts_with("**") && trimmed.contains("Source") || trimmed == "Source" {
+            continue
+        }
+
 
         // Bake base style into spans so ratatui actually paints them.
         let base = line.style;
@@ -194,7 +204,12 @@ fn process_markdown(mut text: Text<'_>) -> Text<'_> {
             for span in &mut line.spans {
                 span.style = base.patch(span.style);
             }
+        } else {
+            for span in &mut line.spans {
+                *span.content.to_mut() = format!(" {}", span.content.as_ref());
+            }
         }
+
 
         // Strip leading "#" prefix (one or more hashes + space) from heading lines.
         if line.style.fg.is_some() && line.style.add_modifier.contains(Modifier::BOLD) {
@@ -235,25 +250,6 @@ impl App {
     }
 }
 
-/// Find the line index of a heading whose content matches `target_name`.
-/// Headings are identified by having a colored fg + bold modifier on the first span.
-fn find_heading_line(text: &[Line<'_>], target_name: &str) -> Option<usize> {
-    let lower_target = target_name.to_lowercase();
-    for (i, line) in text.iter().enumerate() {
-        let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        if let Some(first_span) = line.spans.first() {
-            if first_span.style.fg.is_some()
-                && first_span.style.add_modifier.contains(Modifier::BOLD)
-            {
-                if content.to_lowercase().contains(&lower_target) {
-                    return Some(i);
-                }
-            }
-        }
-    }
-    None
-}
-
 fn run_app(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     registry: Registry,
@@ -278,7 +274,9 @@ fn run_app(
         list_state: ListState::default(),
         detail_md: String::new(),
         detail_scroll: 0,
-        detail_target: None,
+        detail_search_query: String::new(),
+        detail_search_matches: Vec::new(),
+        detail_search_pos: 0,
         tx: tx_req,
         rx: rx_rep,
         search_id: 0,
@@ -326,6 +324,7 @@ fn run_app(
                     }
                 }
                 AppMode::Detail => handle_detail_key(&mut app, key),
+                AppMode::DetailSearch => handle_detail_search_key(&mut app, key),
                 AppMode::Help => {
                     app.mode = AppMode::Search;
                 }
@@ -446,12 +445,19 @@ fn handle_search_key(app: &mut App, key: event::KeyEvent) -> bool {
                 let item = &app.registry.all_items()[idx];
                 app.detail_md = app.registry.load_doc_content(&item.html_rel);
                 app.detail_scroll = 0;
-                // Extract fragment anchor from html_rel (e.g. "#method.add" -> "add")
-                app.detail_target = item
-                    .html_rel
-                    .split('#')
-                    .nth(1)
-                    .map(|frag| frag.split('.').last().unwrap_or(frag).to_string());
+                // Auto-search for fragment anchor on first open.
+                // e.g. "#method.add" -> "add"
+                app.detail_search_query.clear();
+                app.detail_search_matches.clear();
+                app.detail_search_pos = 0;
+                if let Some(frag) = item.html_rel.split('#').nth(1) {
+                    let name = frag.split('.').last().unwrap_or(frag).to_string();
+                    app.detail_search_query = name.clone();
+                    run_detail_search(app, &name);
+                    if !app.detail_search_matches.is_empty() {
+                        scroll_to_match(app);
+                    }
+                }
                 app.mode = AppMode::Detail;
             }
         }
@@ -525,8 +531,187 @@ fn handle_detail_key(app: &mut App, key: event::KeyEvent) {
         KeyCode::End => {
             app.detail_scroll = u16::MAX;
         }
+        KeyCode::Char('/') => {
+            // Enter detail search mode.
+            app.mode = AppMode::DetailSearch;
+        }
+        KeyCode::Char('n') => {
+            if !app.detail_search_matches.is_empty() {
+                app.detail_search_pos = (app.detail_search_pos + 1)
+                    % app.detail_search_matches.len();
+                scroll_to_match(app);
+            }
+        }
+        KeyCode::Char('N') => {
+            if !app.detail_search_matches.is_empty() {
+                app.detail_search_pos = (app.detail_search_pos.wrapping_sub(1))
+                    .min(app.detail_search_matches.len().saturating_sub(1));
+                scroll_to_match(app);
+            }
+        }
         _ => {}
     }
+}
+
+/// Handle a key press while in detail search mode (`/`).
+fn handle_detail_search_key(app: &mut App, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            // Exit search mode, keep last results visible.
+            app.mode = AppMode::Detail;
+        }
+        KeyCode::Enter => {
+            // Jump to first match and exit search input mode.
+            if !app.detail_search_matches.is_empty() {
+                app.detail_search_pos = 0;
+                scroll_to_match(app);
+            }
+            app.mode = AppMode::Detail;
+        }
+        KeyCode::Char(c) => {
+            app.detail_search_query.push(c);
+            let query = app.detail_search_query.clone();
+            run_detail_search(app, &query);
+            app.detail_search_pos = 0;
+        }
+        KeyCode::Backspace => {
+            app.detail_search_query.pop();
+            if app.detail_search_query.is_empty() {
+                app.detail_search_matches.clear();
+                app.detail_search_pos = 0;
+            } else {
+                let query = app.detail_search_query.clone();
+                run_detail_search(app, &query);
+                app.detail_search_pos = 0;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Search rendered text lines for `query` (case-insensitive substring).
+/// Highlight occurrences of `query` in every span of `text`.
+/// Matches get a yellow background with dark foreground.
+const HIGHLIGHT_BG: Color = Color::Rgb(255, 220, 60);
+const HIGHLIGHT_FG: Color = Color::Rgb(30, 30, 30);
+
+fn highlight_query<'a>(text: Text<'a>, query: &'a str) -> Text<'static> {
+    if query.is_empty() {
+        return Text::raw("");
+    }
+    let lower_query = query.to_lowercase();
+    let mut new_lines = Vec::with_capacity(text.lines.len());
+    for line in text.lines {
+        let base_style = line.style;
+        let mut new_spans = Vec::new();
+        for span in line.spans {
+            let s = span.content.as_ref().to_string();
+            let patched_style = base_style.patch(span.style);
+            if s.to_lowercase().contains(&lower_query) {
+                let parts = split_at_owned(&s, &lower_query);
+                for (piece, is_match) in parts {
+                    new_spans.push(Span::styled(
+                        piece,
+                        if is_match {
+                            patched_style.patch(
+                                Style::default()
+                                    .bg(HIGHLIGHT_BG)
+                                    .fg(HIGHLIGHT_FG),
+                            )
+                        } else {
+                            patched_style
+                        },
+                    ));
+                }
+            } else {
+                new_spans.push(Span::styled(s, patched_style));
+            }
+        }
+        new_lines.push(Line::from(new_spans).style(base_style));
+    }
+    Text::from(new_lines)
+}
+
+/// Split `s` into owned segments, marking which ones match `lower_query`.
+fn split_at_owned(s: &str, lower_query: &str) -> Vec<(String, bool)> {
+    let lower_s = s.to_lowercase();
+    let mut result = Vec::new();
+    let mut start = 0;
+    while let Some(idx) = lower_s[start..].find(lower_query) {
+        let abs_idx = start + idx;
+        if abs_idx > start {
+            result.push((s[start..abs_idx].to_string(), false));
+        }
+        result.push((s[abs_idx..abs_idx + lower_query.len()].to_string(), true));
+        start = abs_idx + lower_query.len();
+    }
+    if start < s.len() {
+        result.push((s[start..].to_string(), false));
+    }
+    if result.is_empty() {
+        result.push((s.to_string(), false));
+    }
+    result
+}
+
+/// Search rendered text lines for `query` (case-insensitive substring).
+/// Stores results in `app.detail_search_matches`, sorted by relevance
+/// (signature-like lines first).
+fn run_detail_search(app: &mut App, query: &str) {
+    let text = app.detail_text();
+    let lower_query = query.to_lowercase();
+    let mut matches: Vec<(usize, u8)> = text.lines.iter().enumerate()
+        .filter_map(|(i, line)| {
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let lower = content.to_lowercase();
+            if !lower.contains(&lower_query) {
+                return None;
+            }
+            let priority = if looks_like_signature_start(&content, &lower_query) {
+                0u8
+            } else {
+                1u8
+            };
+            Some((i, priority))
+        })
+        .collect();
+    matches.sort_by_key(|&(_, p)| p);
+    app.detail_search_matches = matches.into_iter().map(|(i, _)| i).collect();
+}
+
+/// Check if a line starts with a Rust item signature whose identifier matches `lower_query`.
+fn looks_like_signature_start(content: &str, lower_query: &str) -> bool {
+    let trimmed = content.trim();
+    let rest = if let Some(paren_pos) = trimmed.find('(') {
+        &trimmed[..paren_pos]
+    } else {
+        trimmed
+    };
+    let stripped = rest.strip_prefix("pub const fn ")
+        .or_else(|| rest.strip_prefix("pub fn "))
+        .or_else(|| rest.strip_prefix("const fn "))
+        .or_else(|| rest.strip_prefix("fn "))
+        .or_else(|| rest.strip_prefix("pub struct "))
+        .or_else(|| rest.strip_prefix("struct "))
+        .or_else(|| rest.strip_prefix("pub enum "))
+        .or_else(|| rest.strip_prefix("enum "))
+        .or_else(|| rest.strip_prefix("pub trait "))
+        .or_else(|| rest.strip_prefix("trait "))
+        .unwrap_or(rest);
+    let ident_end = stripped.find(char::is_whitespace)
+        .unwrap_or(stripped.find('<').unwrap_or(stripped.find(':').unwrap_or(stripped.len())));
+    let ident = stripped[..ident_end].trim();
+    ident.eq_ignore_ascii_case(lower_query)
+}
+
+/// Scroll so that `detail_search_matches[detail_search_pos]` is visible near top.
+fn scroll_to_match(app: &mut App) {
+    if app.detail_search_matches.is_empty() || app.detail_search_pos >= app.detail_search_matches.len() {
+        return;
+    }
+    let target_line = app.detail_search_matches[app.detail_search_pos];
+    // We don't know exact visible height here, use a reasonable offset.
+    app.detail_scroll = target_line.saturating_sub(2).min(i32::MAX as usize) as u16;
 }
 
 fn navigate_list(app: &mut App, delta: i32) {
@@ -565,7 +750,7 @@ fn render(f: &mut Frame, app: &mut App) {
 
     match app.mode {
         AppMode::Search => render_search(f, app, size),
-        AppMode::Detail => render_detail(f, app, size),
+        AppMode::Detail | AppMode::DetailSearch => render_detail(f, app, size),
         AppMode::Help => render_help(f, size),
     }
 }
@@ -768,21 +953,11 @@ fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
 
     // Markdown content
     let visible = chunks[1].height.saturating_sub(2) as usize;
-    let target = app.detail_target.take();
-    let text = app.detail_text();
-
-    // If there's a pending fragment target, find matching heading and adjust scroll.
-    if let Some(tgt) = target {
-        if let Some(line_idx) = find_heading_line(&text.lines, &tgt) {
-            let max_s = text.lines.len().saturating_sub(visible);
-            let new_scroll = (line_idx.saturating_sub(2)).min(max_s);
-            drop(text);
-            app.detail_scroll = new_scroll as u16;
-        }
-    }
-
-    // Re-render with (possibly updated) scroll position.
-    let text = app.detail_text();
+    let text = if !app.detail_search_query.is_empty() && !app.detail_search_matches.is_empty() {
+        highlight_query(app.detail_text(), &app.detail_search_query)
+    } else {
+        app.detail_text()
+    };
     let line_count = text.lines.len();
     let max_scroll = line_count.saturating_sub(visible) as u16;
     let scroll = app.detail_scroll.min(max_scroll);
@@ -793,12 +968,11 @@ fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Rgb(60, 70, 80))),
         )
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: false });
+        .scroll((scroll, 0));
     f.render_widget(content, chunks[1]);
 
-    // Footer with key hints
-    let footer = Paragraph::new(Line::from(vec![
+    // Footer with key hints (+ optional search bar)
+    let mut footer_spans: Vec<Span<'_>> = vec![
         Span::styled(
             " esc/q ",
             Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
@@ -813,10 +987,44 @@ fn render_detail(f: &mut Frame, app: &mut App, size: Rect) {
             " space/backspace ",
             Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
         ),
-        Span::raw("page"),
-    ]))
-    .style(Style::default().fg(Color::Rgb(80, 100, 120)));
+        Span::raw("page  "),
+        Span::styled(
+            " / ",
+            Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
+        ),
+        Span::raw("search  "),
+        Span::styled(
+            " n/N ",
+            Style::default().fg(Color::Rgb(140, 180, 200)).bold(),
+        ),
+        Span::raw("next/prev"),
+    ];
+
+    // Show active search indicator.
+    if !app.detail_search_query.is_empty() && !app.detail_search_matches.is_empty() {
+        let pos_str = format!(" {}:{} ", app.detail_search_pos + 1, app.detail_search_matches.len());
+        footer_spans.push(Span::styled(pos_str,
+            Style::default().fg(Color::Rgb(255, 220, 100)).bold()));
+    } else if !app.detail_search_query.is_empty() {
+        footer_spans.push(Span::styled(" no matches ",
+            Style::default().fg(Color::Rgb(255, 100, 100)).bold()));
+    }
+
+    let footer = Paragraph::new(Line::from(footer_spans))
+        .style(Style::default().fg(Color::Rgb(80, 100, 120)));
     f.render_widget(footer, chunks[2]);
+
+    // Overlay search bar when in DetailSearch mode.
+    if app.mode == AppMode::DetailSearch {
+        let bar_text = format!(" / {}█", app.detail_search_query);
+        let bar = Paragraph::new(Line::from(vec![
+            Span::styled(bar_text, Style::default()
+                .bg(Color::Rgb(60, 70, 80))
+                .fg(Color::Rgb(255, 220, 100))),
+        ]));
+        f.render_widget(Clear, chunks[2]);
+        f.render_widget(bar, chunks[2]);
+    }
 }
 
 fn render_help(f: &mut Frame, size: Rect) {
@@ -1089,4 +1297,5 @@ fn main() {
             }
         }
     }
+
 }

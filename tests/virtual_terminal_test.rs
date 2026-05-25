@@ -4,10 +4,11 @@
 //! and reads back the rendered ANSI output after each interaction step.
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
-use strip_ansi::strip_ansi;
+use regex::Regex;
 use std::io::{Read, Write};
-use std::sync::mpsc;
+use std::sync::{OnceLock, mpsc};
 use std::time::Duration;
+
 
 /// Return the path to the compiled `clidoc` binary.
 fn clidoc_bin() -> std::path::PathBuf {
@@ -15,7 +16,15 @@ fn clidoc_bin() -> std::path::PathBuf {
         .unwrap().get_program()
         .into()
 }
-
+fn strip_styles(input: &str) -> String {
+    static ANSI_REGEX: OnceLock<Regex> = OnceLock::new();
+    let re = ANSI_REGEX.get_or_init(|| {
+        // Matches standard CSI sequences (like colors/styles) but ignores raw control bytes
+        Regex::new(r"[\x1b\x9b]\[[0-?]*[ -/]*[@-~]").unwrap()
+    });
+    
+    re.replace_all(input, "").into_owned()
+}
 /// Continuously read from the PTY in a background thread and collect all output.
 struct OutputCollector {
     rx: mpsc::Receiver<Vec<u8>>,
@@ -84,11 +93,7 @@ impl Drop for OutputCollector {
     }
 }
 
-/// Search for `ratatui::text::Span::add`, press Enter, and verify that "fn add" appears on screen.
-///
-/// This test is expected to **fail** right now because no ratatui doc source
-/// is indexed in the local registry — the search returns no results, so pressing
-/// Enter does nothing and the detail panel never shows.
+/// Search for `add`, press Enter, and verify that "fn add" appears on screen.
 #[test]
 fn search_span_add_shows_fn_add() {
     let pty_system = NativePtySystem::default();
@@ -138,7 +143,6 @@ fn search_span_add_shows_fn_add() {
     // Wait for the app to process keystrokes and re-render the search results.
     std::thread::sleep(Duration::from_millis(1800));
     let _after_query = collector.wait_and_drain(Duration::from_millis(100));
-    println!("{}", strip_ansi(&_after_query));
     writer.write_all(b"\x1b[B").expect("failed to write byte");
     writer.flush().expect("failed to flush");
     std::thread::sleep(Duration::from_millis(1800));
@@ -161,10 +165,12 @@ fn search_span_add_shows_fn_add() {
     drop(collector);
     drop(writer);
 
+    let stripped = strip_styles(&final_output);
+    //print!("{}", stripped);
     // Assert that "fn add" is present in the rendered output.
     assert!(
-        final_output.contains("fn add"),
+        stripped.contains("fn add"),
         "Expected 'fn add' in terminal output, but got:\n{}",
-        strip_ansi::strip_ansi(&final_output),
+        stripped,
     );
 }

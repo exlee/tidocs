@@ -24,3 +24,4 @@ insta = { version = "1", features = ["yaml"] }
 assert_cmd = "2"
 portable-pty = "0.9"
 predicates = "3"
+regex = "1.12.3"
